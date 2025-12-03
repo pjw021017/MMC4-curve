@@ -85,7 +85,7 @@ def predict_points(df, input_cols, out_cols, label_to_col, inputs):
 
     # MMC4 파라미터 피팅 및 곡선
     C = core.fit_mmc4(etas, epss)
-    # η 범위 고정: -0.1 ~ 0.7
+    # --- x축(η) 범위 고정: -0.1 ~ 0.7 ---
     eta_grid = np.linspace(-0.1, 0.7, 50)
     curve = core.mmc4_eps(eta_grid, C)
 
@@ -136,7 +136,9 @@ def main():
         ax.set_ylabel("Fracture strain εf")
 
         # ---- 축 범위 고정 ----
+        # x축: -0.1 ~ 0.7
         ax.set_xlim(-0.1, 0.7)
+        # y축: 0 ~ Bulge점 + 0.3
         bulge_eps = points["Bulge"][1]
         ax.set_ylim(0.0, bulge_eps + 0.3)
 
