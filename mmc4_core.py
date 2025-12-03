@@ -11,6 +11,7 @@
 - 그룹 증강은 총샘플수를 정확히 맞추도록 균등 분배(+잔여분 일부 그룹 +1)
 """
 
+import os
 import re, warnings
 warnings.filterwarnings("ignore")
 
@@ -27,7 +28,8 @@ from sklearn.metrics import r2_score
 from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor, HistGradientBoostingRegressor
 
 # --------------------- 경로/설정 ---------------------
-XLSX_PATH = Path("data_mmc4.xlsx")
+BASE_DIR = os.path.dirname(__file__)
+XLSX_PATH = os.path.join(BASE_DIR, "data_mmc4.xlsx")
 SHEET     = "학습DB"
 N_JOBS    = -1
 rng       = np.random.default_rng()   # 실행마다 다른 RNG
