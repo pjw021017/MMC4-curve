@@ -480,7 +480,8 @@ if st.button("예측 및 MMC4 플롯"):
     C_hat = fit_mmc4(etas, epss)
 
     # (7) 플롯
-    eta_grid = np.linspace(-0.4, 0.8, 200)
+    # η 그리드 범위: -0.1 ~ 0.7
+    eta_grid = np.linspace(-0.1, 0.7, 200)
     eps_curve = mmc4_eps(eta_grid, C_hat)
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
@@ -496,6 +497,11 @@ if st.button("예측 및 MMC4 플롯"):
     ax.set_xlabel("Triaxiality (η)")
     ax.set_ylabel("Fracture strain (εf)")
     ax.set_title("MMC4 Curve")
+
+    # 축 범위 고정: x축 -0.1~0.7, y축 0~Bulge점 εf + 0.3
+    ax.set_xlim(-0.1, 0.7)
+    ax.set_ylim(0.0, float(ef_bulge) + 0.3)
+
     ax.grid(True, alpha=0.3)
     ax.legend()
     st.pyplot(fig)
