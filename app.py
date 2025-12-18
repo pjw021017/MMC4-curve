@@ -345,7 +345,7 @@ if len(extra_inputs) or len(CAT_INPUTS):
 # ===== MMC4 수식 관련 함수 =====
 def theta_bar(eta):
     arg = -(27.0 / 2.0) * eta * (eta ** 2 - 1.0 / 3.0)
-    arg = np.clip(arg, -1.0, 1.0)
+#    arg = np.clip(arg, -1.0, 1.0)
     return 1.0 - (2.0 / np.pi) * np.arccos(arg)
 
 
