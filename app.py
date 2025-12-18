@@ -366,7 +366,7 @@ def mmc4_eps(eta, C):
     term1 = (C1 / C4) * (
         C5 + k * (c6e - C5) * (1.0 / np.cos(tb * np.pi / 6.0) - 1.0)
     )
-    base = 1.0 + (C3 ** 2) / 3.0 * np.cos(tb * np.pi / 6.0) \
+    base = np.sqrt(1.0 + (C3 ** 2) / 3.0) * np.cos(tb * np.pi / 6.0) \
            + C3 * (eta + (1.0 / 3.0) * np.sin(tb * np.pi / 6.0))
     base = np.maximum(base, 1e-6)
     return term1 * (base ** (-1.0 / C2))
