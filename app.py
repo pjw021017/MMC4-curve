@@ -344,46 +344,77 @@ if len(extra_inputs) or len(CAT_INPUTS):
 
 # ===== MMC4 수식 관련 함수 =====
 def theta_bar(eta):
+    """
+    θ̄ = 1 - (2/π) arccos{ -(27/2) η (η² - 1/3) }
+    """
     arg = -(27.0 / 2.0) * eta * (eta ** 2 - 1.0 / 3.0)
-#    arg = np.clip(arg, -1.0, 1.0)
+    # 수치 오차 방지용 클리핑
+    arg = np.clip(arg, -1.0, 1.0)
     return 1.0 - (2.0 / np.pi) * np.arccos(arg)
 
 
 def c6_effective(eta, C6):
+    """
+    C6(η) =
+      1   ,  η ≤ -1/√3  or  0 ≤ η ≤ 1/√3
+      C6  ,  -1/√3 < η < 0  or  η > 1/√3
+    """
     t = 1.0 / np.sqrt(3.0)
     return np.where(
-        (eta <= -t) | ((eta >= 0) & (eta <= t)),
+        (eta <= -t) | ((eta >= 0.0) & (eta <= t)),
         1.0,
         float(C6)
     )
 
 
 def mmc4_eps(eta, C):
+    """
+    εf(η) = [ C1/C4 * ( C5 + k (C6_eff - C5) (1/cos(θ̄π/6) - 1) ) ]
+            * [ √(1 + C3²/3) cos(θ̄π/6)
+                + C3 ( η + 1/3 sin(θ̄π/6) )
+              ]^(-1/C2)
+    where k = √3 / (2 - √3)
+    """
     C1, C2, C3, C4, C5, C6 = C
-    tb = theta_bar(eta)
-    c6e = c6_effective(eta, C6)
+
+    tb = theta_bar(eta)          # θ̄(η)
+    c6e = c6_effective(eta, C6)  # 구간별 C6 처리
     k = np.sqrt(3.0) / (2.0 - np.sqrt(3.0))
+
+    # 앞 대괄호: C1/C4 * ( C5 + k (C6_eff - C5)(1/cos - 1) )
     term1 = (C1 / C4) * (
         C5 + k * (c6e - C5) * (1.0 / np.cos(tb * np.pi / 6.0) - 1.0)
     )
+
+    # 뒤 대괄호: √(1 + C3²/3) cos(θ̄π/6) + C3(η + 1/3 sin(θ̄π/6))
     base = np.sqrt(1.0 + (C3 ** 2) / 3.0) * np.cos(tb * np.pi / 6.0) \
            + C3 * (eta + (1.0 / 3.0) * np.sin(tb * np.pi / 6.0))
+
+    # 수치 안전장치
     base = np.maximum(base, 1e-6)
+
+    # 지수 -1/C2
     return term1 * (base ** (-1.0 / C2))
 
 
 def fit_mmc4(etas, epss):
+    """
+    주어진 4점(또는 N점)의 (η, εf)에 대해 MMC4 파라미터 C1~C6 피팅
+    """
     def resid(p):
         return mmc4_eps(etas, p) - epss
 
+    # 초기값과 bounds는 논문/경험 기반의 적당한 범위
     x0 = np.array([1.0, 1.0, 0.2, 1.0, 0.6, 0.8])
     lb = np.array([0.001, 0.10, -2.0, 0.10, 0.0, 0.0])
-    ub = np.array([10.0, 5.0, 2.0, 5.0, 2.0, 2.0])
+    ub = np.array([10.0, 5.0,  2.0, 5.0, 2.0, 2.0])
+
     res = least_squares(
         resid, x0, bounds=(lb, ub),
         max_nfev=5000, verbose=0
     )
     return res.x
+
 
 
 # ===== 예측 및 플롯 =====
