@@ -97,8 +97,7 @@ def classify_rgb(rgb):
 
 def infer_by_name(columns):
     in_pats = ["yield", "ultimate", "elongation", "r-value", "tension", "입력", "input"]
-    out_pats = ["notch", "shear", "bulge", "punch", "fracture",
-                "triaxiality", "예측", "output"]
+    out_pats = ["notch", "shear", "bulge", "punch", "fracture", "triaxiality", "예측", "output"]
     ins, outs = [], []
     for c in columns:
         cl = str(c).lower()
@@ -360,21 +359,24 @@ def c6_effective(eta, C6):
 
 
 def mmc4_eps(eta, C):
+    """
+    εf =
+    [ C1/C4 ( C5 + (√3/(2-√3))(C6eff - C5)(1/cos(θ̄π/6) - 1) ) ]
+    × [ sqrt(1 + C3²/3) cos(θ̄π/6) + C3(η + 1/3 sin(θ̄π/6)) ]^(-1/C2)
+    """
     C1, C2, C3, C4, C5, C6 = C
     tb = theta_bar(eta)
     c6e = c6_effective(eta, C6)
-
     k = np.sqrt(3.0) / (2.0 - np.sqrt(3.0))
 
-    # 앞 괄호
     term1 = (C1 / C4) * (
         C5 + k * (c6e - C5) * (1.0 / np.cos(tb * np.pi / 6.0) - 1.0)
     )
 
-    # 뒤 괄호 (지수는 -1/C2)
     base = np.sqrt(1.0 + (C3 ** 2) / 3.0) * np.cos(tb * np.pi / 6.0) \
            + C3 * (eta + (1.0 / 3.0) * np.sin(tb * np.pi / 6.0))
     base = np.maximum(base, 1e-6)
+
     return term1 * (base ** (-1.0 / C2))
 
 
@@ -485,14 +487,9 @@ if st.button("예측 및 MMC4 플롯"):
     epss = np.array([p[2] for p in pts])
     C_hat = fit_mmc4(etas, epss)
 
-    # (7) 플롯
-    # ─────────────────────────────────────────────
-    #   MMC4 곡선은 데이터가 있는 범위(특히 Bulge η=2/3)까지만 그림
-    #   → Bulge 오른쪽으로 내려가는 외삽 구간을 잘라냄
-    # ─────────────────────────────────────────────
-    eta_min = -0.1
-    eta_max_curve = float(eta_bulge)      # 곡선은 여기까지만
-    eta_grid = np.linspace(eta_min, eta_max_curve, 400)
+    # (7) 플롯: Bulge에서 자르지 않고, 정해진 범위[-0.1, 0.7] 전체에서
+    #          mmc4_eps(η, C_hat)을 그대로 그림
+    eta_grid = np.linspace(-0.1, 0.7, 400)
     eps_curve = mmc4_eps(eta_grid, C_hat)
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
@@ -509,7 +506,7 @@ if st.button("예측 및 MMC4 플롯"):
     ax.set_ylabel("Fracture strain (εf)")
     ax.set_title("MMC4 Curve")
 
-    # 축 범위: x축 -0.1~0.7, y축 0~Bulge점 εf + 0.3
+    # 축 범위 고정: x축 -0.1~0.7, y축 0~Bulge점 εf + 0.3
     ax.set_xlim(-0.1, 0.7)
     ax.set_ylim(0.0, float(ef_bulge) + 0.3)
 
