@@ -360,24 +360,34 @@ def c6_effective(eta, C6):
 
 def mmc4_eps(eta, C):
     """
-    εf =
-    [ C1/C4 ( C5 + (√3/(2-√3))(C6eff - C5)(1/cos(θ̄π/6) - 1) ) ]
-    × [ sqrt(1 + C3²/3) cos(θ̄π/6) + C3(η + 1/3 sin(θ̄π/6)) ]^(-1/C2)
+    MMC4 식을 그림의 수식 그대로 구현:
+    εf = [C1/C4 (C5 + k (C6_eff - C5)(1/cos(θ̄π/6) - 1))]
+         * [ sqrt( 1 + (C3^2/3) cos(θ̄π/6) + C3(η + 1/3 sin(θ̄π/6)) ) ]^(-1/C2)
     """
     C1, C2, C3, C4, C5, C6 = C
     tb = theta_bar(eta)
+
+    cos_term = np.cos(tb * np.pi / 6.0)
+    sin_term = np.sin(tb * np.pi / 6.0)
+
+    # cos(·)가 0 근처에서 발산 방지
+    cos_safe = np.where(np.abs(cos_term) < 1e-6,
+                        1e-6 * np.sign(cos_term + 1e-12),
+                        cos_term)
+
     c6e = c6_effective(eta, C6)
     k = np.sqrt(3.0) / (2.0 - np.sqrt(3.0))
 
     term1 = (C1 / C4) * (
-        C5 + k * (c6e - C5) * (1.0 / np.cos(tb * np.pi / 6.0) - 1.0)
+        C5 + k * (c6e - C5) * (1.0 / cos_safe - 1.0)
     )
 
-    base = np.sqrt(1.0 + (C3 ** 2) / 3.0) * np.cos(tb * np.pi / 6.0) \
-           + C3 * (eta + (1.0 / 3.0) * np.sin(tb * np.pi / 6.0))
-    base = np.maximum(base, 1e-6)
+    inside = 1.0 + (C3 ** 2) / 3.0 * cos_term \
+             + C3 * (eta + (1.0 / 3.0) * sin_term)
+    inside = np.maximum(inside, 1e-8)
 
-    return term1 * (base ** (-1.0 / C2))
+    term2 = np.sqrt(inside)
+    return term1 * (term2 ** (-1.0 / C2))
 
 
 def fit_mmc4(etas, epss):
@@ -487,9 +497,8 @@ if st.button("예측 및 MMC4 플롯"):
     epss = np.array([p[2] for p in pts])
     C_hat = fit_mmc4(etas, epss)
 
-    # (7) 플롯: Bulge에서 자르지 않고, 정해진 범위[-0.1, 0.7] 전체에서
-    #          mmc4_eps(η, C_hat)을 그대로 그림
-    eta_grid = np.linspace(-0.1, 0.7, 400)
+    # (7) 플롯: 정해진 범위(-0.1 ~ 0.7) 전체에 대해 함수 값 계산
+    eta_grid = np.linspace(-0.1, 0.7, 200)
     eps_curve = mmc4_eps(eta_grid, C_hat)
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
