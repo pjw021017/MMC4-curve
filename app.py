@@ -387,7 +387,6 @@ def mmc4_eps(eta, C):
     return term1 * (base ** (-1.0 / C2))
 
 
-
 def fit_mmc4(etas, epss):
     """
     주어진 4점(또는 N점)의 (η, εf)에 대해 MMC4 파라미터 C1~C6 피팅
