@@ -97,7 +97,8 @@ def classify_rgb(rgb):
 
 def infer_by_name(columns):
     in_pats = ["yield", "ultimate", "elongation", "r-value", "tension", "입력", "input"]
-    out_pats = ["notch", "shear", "bulge", "punch", "fracture", "triaxiality", "예측", "output"]
+    out_pats = ["notch", "shear", "bulge", "punch", "fracture",
+                "triaxiality", "예측", "output"]
     ins, outs = [], []
     for c in columns:
         cl = str(c).lower()
@@ -344,24 +345,15 @@ if len(extra_inputs) or len(CAT_INPUTS):
 
 # ===== MMC4 수식 관련 함수 =====
 def theta_bar(eta):
-    """
-    θ̄ = 1 - (2/π) arccos{ -(27/2) η (η² - 1/3) }
-    """
     arg = -(27.0 / 2.0) * eta * (eta ** 2 - 1.0 / 3.0)
-    # 수치 오차 방지용 클리핑
     arg = np.clip(arg, -1.0, 1.0)
     return 1.0 - (2.0 / np.pi) * np.arccos(arg)
 
 
 def c6_effective(eta, C6):
-    """
-    C6(η) =
-      1   ,  η ≤ -1/√3  or  0 ≤ η ≤ 1/√3
-      C6  ,  -1/√3 < η < 0  or  η > 1/√3
-    """
     t = 1.0 / np.sqrt(3.0)
     return np.where(
-        (eta <= -t) | ((eta >= 0.0) & (eta <= t)),
+        (eta <= -t) | ((eta >= 0) & (eta <= t)),
         1.0,
         float(C6)
     )
@@ -372,39 +364,32 @@ def mmc4_eps(eta, C):
     tb = theta_bar(eta)
     c6e = c6_effective(eta, C6)
 
-    # k = √3 / (2 - √3)
     k = np.sqrt(3.0) / (2.0 - np.sqrt(3.0))
 
+    # 앞 괄호
     term1 = (C1 / C4) * (
         C5 + k * (c6e - C5) * (1.0 / np.cos(tb * np.pi / 6.0) - 1.0)
     )
 
-    base = np.sqrt((1.0 + C3**2) / 3.0) * np.cos(tb * np.pi / 6.0) \
+    # 뒤 괄호 (지수는 -1/C2)
+    base = np.sqrt(1.0 + (C3 ** 2) / 3.0) * np.cos(tb * np.pi / 6.0) \
            + C3 * (eta + (1.0 / 3.0) * np.sin(tb * np.pi / 6.0))
-
     base = np.maximum(base, 1e-6)
-
     return term1 * (base ** (-1.0 / C2))
 
 
 def fit_mmc4(etas, epss):
-    """
-    주어진 4점(또는 N점)의 (η, εf)에 대해 MMC4 파라미터 C1~C6 피팅
-    """
     def resid(p):
         return mmc4_eps(etas, p) - epss
 
-    # 초기값과 bounds는 논문/경험 기반의 적당한 범위
     x0 = np.array([1.0, 1.0, 0.2, 1.0, 0.6, 0.8])
     lb = np.array([0.001, 0.10, -2.0, 0.10, 0.0, 0.0])
-    ub = np.array([10.0, 5.0,  2.0, 5.0, 2.0, 2.0])
-
+    ub = np.array([10.0, 5.0, 2.0, 5.0, 2.0, 2.0])
     res = least_squares(
         resid, x0, bounds=(lb, ub),
         max_nfev=5000, verbose=0
     )
     return res.x
-
 
 
 # ===== 예측 및 플롯 =====
@@ -501,8 +486,13 @@ if st.button("예측 및 MMC4 플롯"):
     C_hat = fit_mmc4(etas, epss)
 
     # (7) 플롯
-    # η 그리드 범위: -0.1 ~ 0.7
-    eta_grid = np.linspace(-0.1, 0.7, 200)
+    # ─────────────────────────────────────────────
+    #   MMC4 곡선은 데이터가 있는 범위(특히 Bulge η=2/3)까지만 그림
+    #   → Bulge 오른쪽으로 내려가는 외삽 구간을 잘라냄
+    # ─────────────────────────────────────────────
+    eta_min = -0.1
+    eta_max_curve = float(eta_bulge)      # 곡선은 여기까지만
+    eta_grid = np.linspace(eta_min, eta_max_curve, 400)
     eps_curve = mmc4_eps(eta_grid, C_hat)
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
@@ -519,7 +509,7 @@ if st.button("예측 및 MMC4 플롯"):
     ax.set_ylabel("Fracture strain (εf)")
     ax.set_title("MMC4 Curve")
 
-    # 축 범위 고정: x축 -0.1~0.7, y축 0~Bulge점 εf + 0.3
+    # 축 범위: x축 -0.1~0.7, y축 0~Bulge점 εf + 0.3
     ax.set_xlim(-0.1, 0.7)
     ax.set_ylim(0.0, float(ef_bulge) + 0.3)
 
