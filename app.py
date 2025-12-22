@@ -33,11 +33,11 @@ SHEET_FALLBACK = "학습DB"
 RSEED = 20250821
 np.random.seed(RSEED)
 
-# 타깃(5개): Notch 2 + Shear 2 + Bulge εf
+# 타깃(6개): Notch 2 + Shear 2 + Bulge 2
 TARGETS_FIXED = [
     "Triaxiality(Notch R05)",     "Fracture strain(Notch R05)",
     "Triaxiality(Shear0)",        "Fracture strain(Shear0)",
-    "Fracture strain(Punch Bulge)"
+    "Triaxiality(Punch Bulge)",   "Fracture strain(Punch Bulge)"
 ]
 
 # Tension η, εf 는 항상 "입력"으로 사용
@@ -96,8 +96,10 @@ def classify_rgb(rgb):
 
 
 def infer_by_name(columns):
-    in_pats = ["yield", "ultimate", "elongation", "r-value", "tension", "입력", "input"]
-    out_pats = ["notch", "shear", "bulge", "punch", "fracture", "triaxiality", "예측", "output"]
+    in_pats = ["yield", "ultimate", "elongation", "r-value",
+               "tension", "입력", "input"]
+    out_pats = ["notch", "shear", "bulge", "punch", "fracture",
+                "triaxiality", "예측", "output"]
     ins, outs = [], []
     for c in columns:
         cl = str(c).lower()
@@ -158,7 +160,9 @@ def build_enhanced_features(df_, input_cols, cat_inputs):
             X['efT_x_etaT'] = efT * etaT
 
     # 추가 상호작용
-    key = [('Total Elongation', tel), ('r-value', rv), ('Triaxiality(Tension)', etaT)]
+    key = [('Total Elongation', tel),
+           ('r-value', rv),
+           ('Triaxiality(Tension)', etaT)]
     for i in range(len(key)):
         for j in range(i + 1, len(key)):
             n1, s1 = key[i]
@@ -181,6 +185,10 @@ def load_and_train():
     df = read_excel_safe(DATA_XLSX)
     df = df.dropna(axis=1, how="all")
 
+    # Bulge η 컬럼이 없다면 2/3 상수로 생성 (fallback)
+    if "Triaxiality(Punch Bulge)" not in df.columns:
+        df["Triaxiality(Punch Bulge)"] = 2.0 / 3.0
+
     headers, classes = [], []
     for col in range(1, ws.max_column + 1):
         cell = ws.cell(row=1, column=col)
@@ -199,8 +207,10 @@ def load_and_train():
     if len(output_cols) == 0:
         inf_in, inf_out = infer_by_name(list(df.columns))
         output_cols = [c for c in inf_out if pd.api.types.is_numeric_dtype(df[c])]
-        input_cols = [c for c in df.columns
-                      if c not in output_cols and pd.api.types.is_numeric_dtype(df[c])]
+        input_cols = [
+            c for c in df.columns
+            if c not in output_cols and pd.api.types.is_numeric_dtype(df[c])
+        ]
 
     cat_inputs = ['Material'] if 'Material' in df.columns else []
 
@@ -359,35 +369,17 @@ def c6_effective(eta, C6):
 
 
 def mmc4_eps(eta, C):
-    """
-    MMC4 식을 그림의 수식 그대로 구현:
-    εf = [C1/C4 (C5 + k (C6_eff - C5)(1/cos(θ̄π/6) - 1))]
-         * [ sqrt( 1 + (C3^2/3) cos(θ̄π/6) + C3(η + 1/3 sin(θ̄π/6)) ) ]^(-1/C2)
-    """
     C1, C2, C3, C4, C5, C6 = C
     tb = theta_bar(eta)
-
-    cos_term = np.cos(tb * np.pi / 6.0)
-    sin_term = np.sin(tb * np.pi / 6.0)
-
-    # cos(·)가 0 근처에서 발산 방지
-    cos_safe = np.where(np.abs(cos_term) < 1e-6,
-                        1e-6 * np.sign(cos_term + 1e-12),
-                        cos_term)
-
     c6e = c6_effective(eta, C6)
     k = np.sqrt(3.0) / (2.0 - np.sqrt(3.0))
-
     term1 = (C1 / C4) * (
-        C5 + k * (c6e - C5) * (1.0 / cos_safe - 1.0)
+        C5 + k * (c6e - C5) * (1.0 / np.cos(tb * np.pi / 6.0) - 1.0)
     )
-
-    inside = 1.0 + (C3 ** 2) / 3.0 * cos_term \
-             + C3 * (eta + (1.0 / 3.0) * sin_term)
-    inside = np.maximum(inside, 1e-8)
-
-    term2 = np.sqrt(inside)
-    return term1 * (term2 ** (-1.0 / C2))
+    base = np.sqrt(1.0 + (C3 ** 2) / 3.0) * np.cos(tb * np.pi / 6.0) \
+           + C3 * (eta + (1.0 / 3.0) * np.sin(tb * np.pi / 6.0))
+    base = np.maximum(base, 1e-6)
+    return term1 * (base ** (-1.0 / C2))
 
 
 def fit_mmc4(etas, epss):
@@ -455,19 +447,19 @@ if st.button("예측 및 MMC4 플롯"):
     if cat_cols_model:
         X_feed[cat_cols_model] = x_one[cat_cols_model].astype(str)
 
-    # (5) 예측 (5 타깃)
+    # (5) 예측 (타깃 전체)
     y_hat = pd.Series(model.predict(X_feed)[0], index=OUTPUTS)
 
-    # (6) 4점 구성 — Tension은 입력값 사용, Bulge η=2/3
+    # (6) 4점 구성 — Tension은 입력값 사용, Bulge도 η/εf 모두 예측 사용
     eta_shear = y_hat.get("Triaxiality(Shear0)")
     ef_shear = y_hat.get("Fracture strain(Shear0)")
     eta_notch = y_hat.get("Triaxiality(Notch R05)")
     ef_notch = y_hat.get("Fracture strain(Notch R05)")
+    eta_bulge = y_hat.get("Triaxiality(Punch Bulge)")
     ef_bulge = y_hat.get("Fracture strain(Punch Bulge)")
 
     eta_tens = float(etaT)
     ef_tens = float(efT)
-    eta_bulge = 2.0 / 3.0
 
     missing = []
     if eta_shear is None:
@@ -478,6 +470,8 @@ if st.button("예측 및 MMC4 플롯"):
         missing.append("η(Notch R05)")
     if ef_notch is None:
         missing.append("εf(Notch R05)")
+    if eta_bulge is None:
+        missing.append("η(Bulge)")
     if ef_bulge is None:
         missing.append("εf(Bulge)")
 
@@ -486,10 +480,10 @@ if st.button("예측 및 MMC4 플롯"):
         st.stop()
 
     pts = [
-        ("Shear", float(eta_shear), float(ef_shear)),
-        ("Tension", float(eta_tens), float(ef_tens)),
-        ("Notch", float(eta_notch), float(ef_notch)),
-        ("Bulge", float(eta_bulge), float(ef_bulge)),
+        ("Shear",   float(eta_shear),  float(ef_shear)),
+        ("Tension", float(eta_tens),   float(ef_tens)),
+        ("Notch",   float(eta_notch),  float(ef_notch)),
+        ("Bulge",   float(eta_bulge),  float(ef_bulge)),
     ]
     pts = sorted(pts, key=lambda t: t[1])
 
@@ -497,7 +491,7 @@ if st.button("예측 및 MMC4 플롯"):
     epss = np.array([p[2] for p in pts])
     C_hat = fit_mmc4(etas, epss)
 
-    # (7) 플롯: 정해진 범위(-0.1 ~ 0.7) 전체에 대해 함수 값 계산
+    # (7) 플롯 — 정해진 범위 내에서 전체 함수 그래프
     eta_grid = np.linspace(-0.1, 0.7, 200)
     eps_curve = mmc4_eps(eta_grid, C_hat)
 
