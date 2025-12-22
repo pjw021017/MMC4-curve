@@ -369,27 +369,19 @@ def c6_effective(eta, C6):
 
 
 def mmc4_eps(eta, C):
-    # η 유효 범위: [-2/3, 2/3] 로 클램핑
-    eta = np.asarray(eta, dtype=float)
-    eta_eff = np.clip(eta, -2.0/3.0, 2.0/3.0)
-
     C1, C2, C3, C4, C5, C6 = C
-
-    tb = theta_bar(eta_eff)
-    c6e = c6_effective(eta_eff, C6)
-
+    tb  = theta_bar(eta)
+    c6e = c6_effective(eta, C6)   # 구간에 따라 1 또는 C6
     k = np.sqrt(3.0) / (2.0 - np.sqrt(3.0))
 
     term1 = (C1 / C4) * (
         C5 + k * (c6e - C5) * (1.0 / np.cos(tb * np.pi / 6.0) - 1.0)
     )
 
-    base = 1.0 \
-        + (C3 ** 2) / 3.0 * np.cos(tb * np.pi / 6.0) \
-        + C3 * (eta_eff + (1.0 / 3.0) * np.sin(tb * np.pi / 6.0))
+    base = np.sqrt(1.0 + (C3 ** 2) / 3.0) * np.cos(tb * np.pi / 6.0) \
+           + C3 * (eta + (1.0 / 3.0) * np.sin(tb * np.pi / 6.0))
 
     base = np.maximum(base, 1e-6)
-
     return term1 * (base ** (-1.0 / C2))
 
 def fit_mmc4(etas, epss):
