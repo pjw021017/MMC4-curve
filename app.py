@@ -4,6 +4,7 @@ warnings.filterwarnings("ignore")
 
 import os
 from io import BytesIO
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -43,11 +44,41 @@ def load_bundle_from_bytes(pkl_bytes: bytes):
 
 st.sidebar.header("모델(pkl) 설정")
 default_pkl = st.sidebar.text_input("pkl 파일명/경로", value="mmc4_model.pkl")
-
 uploaded_pkl = st.sidebar.file_uploader("pkl 업로드(옵션)", type=["pkl"])
 
 bundle = None
 load_err = None
+
+
+def resolve_pkl_path(name_or_path: str) -> Path | None:
+    """
+    Streamlit Cloud에서 cwd가 달라져도, app.py 위치 기준으로 pkl을 찾도록 보강.
+    """
+    here = Path(__file__).resolve().parent
+
+    candidates = [
+        Path(name_or_path),                 # 현재 작업 디렉토리 기준
+        here / name_or_path,                # app.py 위치 기준
+        here / "mmc4_model.pkl",             # 표준 파일명
+    ]
+
+    for p in candidates:
+        try:
+            if p.exists() and p.is_file():
+                return p
+        except Exception:
+            pass
+
+    # 혹시 폴더 구조가 꼬였을 때를 대비해 repo 내 전체 검색(비용 낮음)
+    try:
+        hits = list(here.rglob("mmc4_model.pkl"))
+        if hits:
+            return hits[0]
+    except Exception:
+        pass
+
+    return None
+
 
 if uploaded_pkl is not None:
     try:
@@ -56,15 +87,40 @@ if uploaded_pkl is not None:
         load_err = f"(업로드 pkl) {e}"
 else:
     try:
-        if not os.path.exists(default_pkl):
-            raise FileNotFoundError(default_pkl)
-        bundle = load_bundle_from_path(default_pkl)
+        pkl_path = resolve_pkl_path(default_pkl)
+        if pkl_path is None:
+            raise FileNotFoundError(f"{default_pkl} (candidates not found)")
+        bundle = load_bundle_from_path(str(pkl_path))
+        st.sidebar.caption(f"로드된 pkl: {pkl_path}")
     except Exception as e:
         load_err = f"(경로 pkl) {e}"
 
 if bundle is None:
     st.error(f"모델 로드 실패: {load_err}")
-    st.info("해결: 레포 루트(=app.py와 같은 폴더)에 mmc4_model.pkl을 업로드하거나, 좌측에서 pkl 업로드를 사용하세요.")
+
+    # ---- 디버그 정보 출력 (원인 즉시 확인용) ----
+    here = Path(__file__).resolve().parent
+    st.write("### 디버그 정보")
+    st.write("현재 작업 디렉토리(CWD):", os.getcwd())
+    st.write("app.py 폴더:", str(here))
+
+    try:
+        st.write("CWD 파일 목록:", sorted(os.listdir(os.getcwd()))[:200])
+    except Exception as e:
+        st.write("CWD 목록 조회 실패:", e)
+
+    try:
+        st.write("app.py 폴더 파일 목록:", sorted(os.listdir(here))[:200])
+    except Exception as e:
+        st.write("app.py 폴더 목록 조회 실패:", e)
+
+    try:
+        hits = [str(p) for p in here.rglob("mmc4_model.pkl")]
+        st.write("repo 내 mmc4_model.pkl 검색 결과:", hits)
+    except Exception as e:
+        st.write("검색 실패:", e)
+
+    st.info("해결: 1) Streamlit Cloud가 최신 커밋을 보고 있는지(브랜치/커밋) 확인  2) Main file path가 루트 app.py인지 확인  3) 임시로 좌측 'pkl 업로드'로 실행")
     st.stop()
 
 model = bundle["model"]
@@ -72,12 +128,12 @@ meta  = bundle["meta"]
 
 INPUTS = meta["input_cols"]
 CAT_INPUTS = meta["cat_inputs"]
-OUTPUTS = meta["output_cols"]      # 5 targets
+OUTPUTS = meta["output_cols"]
 MEDIANS = meta.get("num_medians", {})
 
 
 # =========================
-# 특징공학 (원본 로직)
+# 특징공학
 # =========================
 def build_enhanced_features(df_, input_cols, cat_inputs):
     X = df_[input_cols + cat_inputs].copy()
@@ -124,7 +180,7 @@ def build_enhanced_features(df_, input_cols, cat_inputs):
 
 
 # =========================
-# MMC4 수식/적합 (원본 로직)
+# MMC4 수식/적합
 # =========================
 def theta_bar(eta):
     arg = -(27.0/2.0)*eta*(eta**2 - 1.0/3.0)
@@ -204,7 +260,6 @@ if st.button("예측 및 MMC4 플롯"):
 
     x_one = pd.DataFrame([x_dict])
 
-    # 누락 컬럼 보강
     for col in INPUTS:
         if col not in x_one.columns:
             x_one[col] = np.nan
@@ -212,10 +267,8 @@ if st.button("예측 및 MMC4 플롯"):
         if col not in x_one.columns:
             x_one[col] = ""
 
-    # 특징공학
     X_tmp = build_enhanced_features(x_one, INPUTS, CAT_INPUTS)
 
-    # 스키마 정렬
     pre = model.named_steps['pre']
     num_cols_model = list(next(t[2] for t in pre.transformers if t[0] == 'num'))
     cat_cols_model = []
@@ -235,10 +288,8 @@ if st.button("예측 및 MMC4 플롯"):
     if cat_cols_model:
         X_feed[cat_cols_model] = x_one[cat_cols_model].astype(str)
 
-    # 예측 (타깃 5개)
     y_hat = pd.Series(model.predict(X_feed)[0], index=OUTPUTS)
 
-    # 4점 확정: Tension은 입력값 사용, Bulge η=2/3 고정
     eta_shear = y_hat.get("Triaxiality(Shear0)")
     ef_shear  = y_hat.get("Fracture strain(Shear0)")
     eta_notch = y_hat.get("Triaxiality(Notch R05)")
@@ -247,7 +298,7 @@ if st.button("예측 및 MMC4 플롯"):
 
     eta_tens  = float(etaT)
     ef_tens   = float(efT)
-    eta_bulge = 2.0/3.0  # Bulge η 상수
+    eta_bulge = 2.0/3.0
 
     missing = []
     if eta_shear is None: missing.append("η(Shear)")
@@ -256,7 +307,7 @@ if st.button("예측 및 MMC4 플롯"):
     if ef_notch  is None: missing.append("εf(Notch R05)")
     if ef_bulge  is None: missing.append("εf(Bulge)")
     if missing:
-        st.error("부족한 값: " + ", ".join(missing) + " — 학습/스키마를 점검하십시오.")
+        st.error("부족한 값: " + ", ".join(missing))
         st.stop()
 
     pts = [
@@ -284,15 +335,12 @@ if "mmc4_pts" in st.session_state and "mmc4_C_hat" in st.session_state:
 
     eta_lo, eta_hi = -0.1, 0.7
     eta_grid = np.linspace(eta_lo, eta_hi, 200)
-
-    # 내부(4점 범위)는 MMC4 그대로
     eps_curve = mmc4_eps(eta_grid, C_hat)
 
     etas = np.array([p[1] for p in pts])
     eta_min = float(etas.min())
     eta_max = float(etas.max())
 
-    # 좌측: 포물선 상승
     e_min = float(mmc4_eps(eta_min, C_hat))
     delta = eta_min - eta_lo
     curv = abs(e_min) / (delta**2 + 1e-6) * 0.6
@@ -304,7 +352,6 @@ if "mmc4_pts" in st.session_state and "mmc4_C_hat" in st.session_state:
     if np.any(mask_left):
         eps_curve[mask_left] = left_curve(eta_grid[mask_left])
 
-    # 우측: 끝점 기울기 유지(C1 연속) 연결
     h = 1e-4
     def d_mmc4(e):
         return float((mmc4_eps(e + h, C_hat) - mmc4_eps(e - h, C_hat)) / (2.0 * h))
@@ -332,30 +379,3 @@ if "mmc4_pts" in st.session_state and "mmc4_C_hat" in st.session_state:
     ax.grid(True,alpha=0.3)
     ax.legend()
     st.pyplot(fig)
-
-    st.markdown("**4점 요약**")
-    for name,x,y in pts:
-        st.text(f"{name:8s} η={x:.4f}  εf={y:.5f}")
-
-    st.markdown("**적합 파라미터 C1~C6**")
-    st.text("C = [" + ", ".join(f"{v:.6f}" for v in C_hat) + "]")
-
-    st.markdown("**특정 η 입력 → εf 출력**")
-    eta_query = st.number_input(
-        "조회할 Triaxiality (η_query)",
-        value=float(np.clip((eta_lo + eta_hi) / 2.0, eta_lo, eta_hi)),
-        min_value=float(eta_lo),
-        max_value=float(eta_hi),
-        step=0.01,
-        format="%.5f",
-        key="mmc4_eta_query"
-    )
-
-    if eta_query < eta_min:
-        eps_query = float(left_curve(eta_query))
-    elif eta_query > eta_max:
-        eps_query = float(right_conn(eta_query))
-    else:
-        eps_query = float(mmc4_eps(eta_query, C_hat))
-
-    st.write(f"**결과:** η = {eta_query:.5f} 에서 **εf = {eps_query:.6f}** 입니다.")
