@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 app.py — 엑셀에서 바로 학습해서 MMC4 curve를 그려주는 Streamlit 앱
-- train_export_model.py + app_mmc4_compact.py 통합 버전
-- 실행 시점에 모델을 학습하므로, pickle 불일치 문제 없음.
+- train_export_model.py + app_mmc4_compact.py 통합
+- mmc4_model.pkl / pickle 전혀 사용하지 않음
+- 앱 실행 시 엑셀에서 바로 학습하고, 그 모델로 MMC4 곡선 도식화
 """
 
 import warnings
@@ -27,6 +28,7 @@ from sklearn.multioutput import MultiOutputRegressor
 
 from scipy.optimize import least_squares
 
+
 # ===== 기본 설정 =====
 DATA_XLSX = "250811_산학프로젝트_포스코의 워크시트.xlsx"  # 같은 폴더에 두기
 SHEET_FALLBACK = "학습DB"
@@ -42,7 +44,7 @@ TARGETS_FIXED = [
 FORCE_INPUT = {"Triaxiality(Tension)", "Fracture strain(Tension)"}
 
 st.set_page_config(page_title="MMC4 Predictor", layout="wide")
-st.title("POSCO MMC4 — 모델 예측 기반 곡선 시각화")
+st.title("POSCO MMC4 — 모델 예측 기반 MMC4 곡선 시각화")
 
 
 # ===== 엑셀/색상 기반 유틸 =====
@@ -121,7 +123,6 @@ def _as_series_single(X: pd.DataFrame, colname: str):
 
 # ===== 특징공학 =====
 def build_enhanced_features(df_, input_cols, cat_inputs):
-    """train_export_model.py와 동일한 특징공학."""
     X = df_[input_cols + cat_inputs].copy()
 
     ys = _as_series_single(X, 'Yield Stress(MPa)')
@@ -181,6 +182,7 @@ def load_and_train():
     df = read_excel_safe(DATA_XLSX)
     df = df.dropna(axis=1, how="all")
 
+    # 색상 기반으로 입력/출력 컬럼 추출
     headers, classes = [], []
     for col in range(1, ws.max_column + 1):
         cell = ws.cell(row=1, column=col)
@@ -195,7 +197,7 @@ def load_and_train():
             elif cls == "skyblue":
                 output_cols.append(name)
 
-    # 색상 정보가 거의 없을 때 이름으로 추론
+    # 색상 정보가 거의 없으면 이름으로 추론
     if len(output_cols) == 0:
         inf_in, inf_out = infer_by_name(list(df.columns))
         output_cols = [c for c in inf_out if pd.api.types.is_numeric_dtype(df[c])]
@@ -214,7 +216,7 @@ def load_and_train():
             if pd.api.types.is_numeric_dtype(df[c]) and c not in input_cols:
                 input_cols.append(c)
 
-    # 타깃은 고정 리스트 중 실제 존재하는 것만 사용 (Bulge η는 타깃에서 제외)
+    # 타깃은 고정 리스트 중 실제 존재하는 것만 사용 (Bulge η는 학습 안함)
     output_cols = [c for c in TARGETS_FIXED if c in df.columns]
 
     # 숫자 변환
@@ -234,7 +236,7 @@ def load_and_train():
     X_all = build_enhanced_features(df_model, input_cols, cat_inputs)
     y_all = df_model[[c for c in output_cols if c in df_model.columns]].copy()
 
-    # 파이프라인 구성 (여기서는 전체 데이터로 바로 학습)
+    # 파이프라인 구성
     num_cols = [c for c in X_all.columns if c not in cat_inputs]
     try:
         ohe = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
@@ -250,7 +252,7 @@ def load_and_train():
     )
 
     def create_et():
-        # random_state=None → 실행마다 약간씩 다른 트리 구조
+        # random_state=None → 실행마다 약간 다른 결과 (pkl 불필요)
         return ExtraTreesRegressor(
             n_estimators=300,
             max_depth=None,
@@ -270,7 +272,7 @@ def load_and_train():
     meta = {
         "input_cols": input_cols,
         "cat_inputs": cat_inputs,
-        "output_cols": list(y_all.columns),  # 5 타깃
+        "output_cols": list(y_all.columns),
         "num_medians": df[input_cols].apply(
             pd.to_numeric, errors="coerce"
         ).median(numeric_only=True).to_dict(),
@@ -283,7 +285,7 @@ def load_and_train():
 try:
     model, meta = load_and_train()
 except Exception as e:
-    st.error(f"모델 학습/로드 실패: {e}")
+    st.error(f"모델 학습 실패: {e}")
     st.stop()
 
 INPUTS = meta["input_cols"]
@@ -325,7 +327,7 @@ with c2:
         value=0.20, min_value=0.0, step=0.001, format="%.5f"
     )
 
-# INPUTS 중에서 위 6개를 제외한 나머지 + 범주형 입력(있다면)을 고급 옵션으로
+# 추가 입력(있으면) + 범주형
 extra_inputs = [
     c for c in INPUTS
     if c not in [
@@ -395,7 +397,8 @@ def fit_mmc4(etas, epss):
 
     x0 = np.array([1.0, 1.0, 0.2, 1.0, 0.6, 0.8])
     lb = np.array([0.001, 0.10, -2.0, 0.10, 0.0, 0.0])
-    ub = np.array([10.0, 5.0, 2.0, 5.0, 2.0, 2.0])
+    ub = np.array([10.0, 5.0,  2.0, 5.0,  2.0, 2.0])
+
     res = least_squares(
         resid, x0, bounds=(lb, ub),
         max_nfev=5000, verbose=0
@@ -421,7 +424,7 @@ if st.button("예측 및 MMC4 플롯"):
 
     x_one = pd.DataFrame([x_dict])
 
-    # (2) 누락 입력 컬럼 보완
+    # (2) 누락 입력 보완
     for col in INPUTS:
         if col not in x_one.columns:
             x_one[col] = np.nan
@@ -432,7 +435,7 @@ if st.button("예측 및 MMC4 플롯"):
     # (3) 특징공학
     X_tmp = build_enhanced_features(x_one, INPUTS, CAT_INPUTS)
 
-    # (4) 파이프라인 스키마에 맞춰 정렬
+    # (4) 파이프라인 입력 스키마 맞추기
     pre = model.named_steps['pre']
     num_cols_model = list(
         next(t[2] for t in pre.transformers if t[0] == 'num')
@@ -457,28 +460,23 @@ if st.button("예측 및 MMC4 플롯"):
     # (5) 예측 (타깃 전체 5개)
     y_hat = pd.Series(model.predict(X_feed)[0], index=OUTPUTS)
 
-    # (6) 4점 구성 — Tension은 입력값 사용, Bulge는 η=2/3 고정, εf만 예측 사용
+    # (6) 4점 구성 — Tension은 입력값, Bulge η=2/3 상수
     eta_shear = y_hat.get("Triaxiality(Shear0)")
-    ef_shear = y_hat.get("Fracture strain(Shear0)")
+    ef_shear  = y_hat.get("Fracture strain(Shear0)")
     eta_notch = y_hat.get("Triaxiality(Notch R05)")
-    ef_notch = y_hat.get("Fracture strain(Notch R05)")
-    ef_bulge = y_hat.get("Fracture strain(Punch Bulge)")
+    ef_notch  = y_hat.get("Fracture strain(Notch R05)")
+    ef_bulge  = y_hat.get("Fracture strain(Punch Bulge)")
 
-    eta_tens = float(etaT)
-    ef_tens = float(efT)
-    eta_bulge = 2.0 / 3.0
+    eta_tens  = float(etaT)
+    ef_tens   = float(efT)
+    eta_bulge = 2.0 / 3.0   # 이론값 고정
 
     missing = []
-    if eta_shear is None:
-        missing.append("η(Shear)")
-    if ef_shear is None:
-        missing.append("εf(Shear)")
-    if eta_notch is None:
-        missing.append("η(Notch R05)")
-    if ef_notch is None:
-        missing.append("εf(Notch R05)")
-    if ef_bulge is None:
-        missing.append("εf(Bulge)")
+    if eta_shear is None: missing.append("η(Shear)")
+    if ef_shear  is None: missing.append("εf(Shear)")
+    if eta_notch is None: missing.append("η(Notch R05)")
+    if ef_notch  is None: missing.append("εf(Notch R05)")
+    if ef_bulge  is None: missing.append("εf(Bulge)")
 
     if missing:
         st.error("부족한 값: " + ", ".join(missing) + " — 엑셀/학습 스키마를 확인하세요.")
@@ -496,8 +494,8 @@ if st.button("예측 및 MMC4 플롯"):
     epss = np.array([p[2] for p in pts])
     C_hat = fit_mmc4(etas, epss)
 
-    # (7) 플롯 — 정해진 범위(-0.1~0.7) 내에서 이론식 그대로 전체 그래프
-    eta_grid = np.linspace(-0.1, 0.7, 200)
+    # (7) MMC4 곡선 플롯 (이론식 그대로 -0.1~0.7 전체 범위)
+    eta_grid = np.linspace(-0.1, 0.7, 300)
     eps_curve = mmc4_eps(eta_grid, C_hat)
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
@@ -513,10 +511,8 @@ if st.button("예측 및 MMC4 플롯"):
     ax.set_xlabel("Triaxiality (η)")
     ax.set_ylabel("Fracture strain (εf)")
     ax.set_title("MMC4 Curve")
-
     ax.set_xlim(-0.1, 0.7)
     ax.set_ylim(0.0, float(ef_bulge) + 0.3)
-
     ax.grid(True, alpha=0.3)
     ax.legend()
     st.pyplot(fig)
