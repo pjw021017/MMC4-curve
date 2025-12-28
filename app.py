@@ -354,12 +354,14 @@ if len(extra_inputs) or len(CAT_INPUTS):
 
 # ===== MMC4 수식 관련 함수 =====
 def theta_bar(eta):
+    eta = np.asarray(eta, dtype=float)
     arg = -(27.0 / 2.0) * eta * (eta ** 2 - 1.0 / 3.0)
     arg = np.clip(arg, -1.0, 1.0)
     return 1.0 - (2.0 / np.pi) * np.arccos(arg)
 
 
 def c6_effective(eta, C6):
+    eta = np.asarray(eta, dtype=float)
     t = 1.0 / np.sqrt(3.0)
     return np.where(
         (eta <= -t) | ((eta >= 0) & (eta <= t)),
@@ -369,16 +371,33 @@ def c6_effective(eta, C6):
 
 
 def mmc4_eps(eta, C):
+    """
+    MMC4 이론식 구현 (논문식 그대로):
+    ε_f = [ C1/C4 * ( C5 + k*(C6_eff - C5)*(1/cos(θ̄π/6) - 1) ) ] *
+          [ sqrt( ((1 + C3^2)/3)*cos(θ̄π/6) + C3*(η + (1/3)sin(θ̄π/6)) ) ]^(-1/C2)
+    """
     C1, C2, C3, C4, C5, C6 = C
+    eta = np.asarray(eta, dtype=float)
+
     tb = theta_bar(eta)
     c6e = c6_effective(eta, C6)
+
+    # 전단상태 보정 term
     k = np.sqrt(3.0) / (2.0 - np.sqrt(3.0))
     term1 = (C1 / C4) * (
         C5 + k * (c6e - C5) * (1.0 / np.cos(tb * np.pi / 6.0) - 1.0)
     )
-    base = np.sqrt(1.0 + (C3 ** 2) / 3.0) * np.cos(tb * np.pi / 6.0) \
-           + C3 * (eta + (1.0 / 3.0) * np.sin(tb * np.pi / 6.0))
-    base = np.maximum(base, 1e-6)
+
+    # 루트 안쪽 전체 (논문식 그대로)
+    base_inside = ((1.0 + C3**2) / 3.0) * np.cos(tb * np.pi / 6.0) \
+                  + C3 * (eta + (1.0 / 3.0) * np.sin(tb * np.pi / 6.0))
+
+    # 수치적 안정성 확보
+    base_inside = np.maximum(base_inside, 1e-12)
+
+    base = np.sqrt(base_inside)
+
+    # 지수는 -1/C2
     return term1 * (base ** (-1.0 / C2))
 
 
@@ -491,7 +510,7 @@ if st.button("예측 및 MMC4 플롯"):
     epss = np.array([p[2] for p in pts])
     C_hat = fit_mmc4(etas, epss)
 
-    # (7) 플롯 — 정해진 범위 내에서 전체 함수 그래프
+    # (7) 플롯 — 정해진 범위(-0.1~0.7) 내에서 전체 함수 그래프
     eta_grid = np.linspace(-0.1, 0.7, 200)
     eps_curve = mmc4_eps(eta_grid, C_hat)
 
