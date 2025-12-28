@@ -2,6 +2,7 @@ streamlit
 numpy
 pandas
 matplotlib
+joblib
 scipy
 scikit-learn
 openpyxl
