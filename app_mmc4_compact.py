@@ -8,84 +8,25 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-from scipy.optimize import least_squares
-from scipy.interpolate import CubicHermiteSpline
+# ✅ pkl 로드 대신: 학습 스크립트에서 바로 모델 번들 생성
+from train_export_model import train_bundle
 
-from train_export_model import (
-    DEFAULT_DATA_PATH,
-    train_bundle_from_bytes,
-    train_bundle_from_path,
-)
-
-# ===== 데이터/모델(실행 시 학습) =====
+# ===== 모델 로드(=실행 시 학습) =====
 st.set_page_config(page_title="MMC4 Predictor", layout="wide")
 st.title("POSCO MMC4 — 모델 예측 기반 곡선 시각화")
 
-# --- 사이드바: 데이터 소스/학습 옵션 ---
-st.sidebar.header("데이터 & 학습 설정")
-
-use_default = st.sidebar.checkbox("리포지토리 기본 데이터 사용", value=True)
-uploaded = None
-if not use_default:
-    uploaded = st.sidebar.file_uploader(
-        "학습 데이터 업로드 (CSV/XLSX)", type=["csv", "xlsx", "xls", "xlsm", "txt"]
-    )
-
-test_size = st.sidebar.slider("검증(Test) 비율", min_value=0.1, max_value=0.4, value=0.25, step=0.05)
-n_estimators = st.sidebar.slider("n_estimators (ExtraTrees)", min_value=50, max_value=600, value=300, step=50)
-random_state = st.sidebar.number_input("random_state", min_value=0, max_value=10_000, value=42, step=1)
-
+# Streamlit은 rerun이 잦아서, 캐시 없으면 매 상호작용마다 재학습됩니다.
 @st.cache_resource(show_spinner=True)
-def get_bundle_cached(data_bytes: bytes, filename: str, test_size: float, n_estimators: int, random_state: int):
-    return train_bundle_from_bytes(
-        data_bytes,
-        filename,
-        test_size=test_size,
-        n_estimators=n_estimators,
-        random_state=random_state,
-    )
+def get_trained_bundle():
+    return train_bundle()
 
-@st.cache_resource(show_spinner=True)
-def get_bundle_default_cached(path: str, test_size: float, n_estimators: int, random_state: int):
-    return train_bundle_from_path(
-        path,
-        test_size=test_size,
-        n_estimators=n_estimators,
-        random_state=random_state,
-    )
-
-# --- 학습 수행(캐시로 rerun 시 재학습 방지) ---
-bundle = None
-data_label = None
-
-if use_default:
-    try:
-        bundle = get_bundle_default_cached(DEFAULT_DATA_PATH, test_size, n_estimators, random_state)
-        data_label = DEFAULT_DATA_PATH
-    except Exception as e:
-        st.sidebar.error(f"기본 데이터 로드/학습 실패: {e}")
-        st.sidebar.info("기본 데이터 파일이 repo에 없으면 업로드 모드로 전환하십시오.")
-else:
-    if uploaded is not None:
-        try:
-            data_bytes = uploaded.getvalue()
-            bundle = get_bundle_cached(data_bytes, uploaded.name, test_size, n_estimators, random_state)
-            data_label = uploaded.name
-        except Exception as e:
-            st.sidebar.error(f"업로드 데이터 학습 실패: {e}")
-
-# 재학습 버튼(캐시 초기화)
-if st.sidebar.button("모델 재학습(캐시 초기화)"):
-    get_bundle_cached.clear()
-    get_bundle_default_cached.clear()
-    st.rerun()
-
-if bundle is None:
-    st.error("학습할 데이터를 불러오지 못했습니다. 사이드바에서 데이터 업로드 또는 기본 데이터 사용을 확인하십시오.")
+try:
+    bundle = get_trained_bundle()
+    model = bundle["model"]
+    meta  = bundle["meta"]
+except Exception as e:
+    st.error(f"모델 학습/로드 실패: {e}")
     st.stop()
-
-model = bundle["model"]
-meta  = bundle["meta"]
 
 INPUTS = meta["input_cols"]
 CAT_INPUTS = meta["cat_inputs"]
@@ -93,17 +34,10 @@ OUTPUTS = meta["output_cols"]      # 5 타깃
 MEDIANS = meta.get("num_medians", {})
 FEATURES = meta.get("feature_columns", [])
 
-with st.expander("학습 요약(데이터/성능)", expanded=False):
-    st.write(f"- 데이터: `{data_label}`")
-    st.write(f"- 학습 행 수: {meta.get('train_rows', 'NA')}")
-    st.write(f"- Test 비율: {meta.get('test_size', test_size)}")
-    st.write(f"- ExtraTrees n_estimators: {meta.get('n_estimators', n_estimators)}")
-    st.write(f"- 전체 평탄화 R²: {meta.get('r2_flat', bundle.get('r2_flat')):.4f}")
-    try:
-        metrics_df = pd.DataFrame(bundle.get("metrics", {})).T
-        st.dataframe(metrics_df, use_container_width=True)
-    except Exception:
-        pass
+# (선택) 재학습 버튼
+if st.sidebar.button("모델 재학습(캐시 초기화)"):
+    get_trained_bundle.clear()
+    st.rerun()
 
 # ===== 특징공학 =====
 def build_enhanced_features(df_, input_cols, cat_inputs):
@@ -117,107 +51,80 @@ def build_enhanced_features(df_, input_cols, cat_inputs):
             s = s.bfill(axis=1).iloc[:, 0]
         return pd.to_numeric(s, errors="coerce")
 
-    ys  = _as_series("Yield Stress(MPa)")
-    uts = _as_series("Ultimate Tensile Stress(MPa)")
-    tel = _as_series("Total Elongation")
-    rv  = _as_series("r-value")
-    etaT= _as_series("Triaxiality(Tension)")
-    efT = _as_series("Fracture strain(Tension)")
+    ys  = _as_series('Yield Stress(MPa)')
+    uts = _as_series('Ultimate Tensile Stress(MPa)')
+    tel = _as_series('Total Elongation')
+    rv  = _as_series('r-value')
+    etaT= _as_series('Triaxiality(Tension)')
+    efT = _as_series('Fracture strain(Tension)')
 
     if uts is not None and ys is not None:
-        X["UTS_to_Yield"]   = uts / (ys + 1e-8)
-        X["Strength_Range"] = uts - ys
+        X['UTS_to_Yield']   = uts / (ys + 1e-8)
+        X['Strength_Range'] = uts - ys
     if tel is not None:
-        X["Elong_sq"] = tel**2
-        X["Elong_sqrt"] = np.sqrt(tel + 1e-8)
+        X['Elong_sq'] = tel**2
+        X['Elong_sqrt'] = np.sqrt(tel + 1e-8)
         if rv is not None:
-            X["Elong_x_r"]   = tel * rv
-            X["Elong_div_r"] = tel / (rv + 1e-8)
+            X['Elong_x_r']   = tel * rv
+            X['Elong_div_r'] = tel / (rv + 1e-8)
     if etaT is not None:
-        X["etaT_sq"]   = etaT**2
-        X["etaT_abs"]  = np.abs(etaT)
+        X['etaT_sq']   = etaT**2
+        X['etaT_cube'] = etaT**3
+        if tel is not None:
+            X['Total Elongation_x_Triaxiality(Tension)'] = tel * etaT
+        if rv is not None:
+            X['r-value_x_Triaxiality(Tension)'] = rv * etaT
+    if rv is not None:
+        X['r_sq']  = rv**2
+        X['r_log'] = np.log(rv + 1e-8)
     if efT is not None:
-        X["efT_sq"]  = efT**2
-        X["log_efT"] = np.log(efT + 1e-8)
-    if etaT is not None and efT is not None:
-        X["etaT_x_efT"] = etaT * efT
-        X["efT_div_etaT"] = efT / (np.abs(etaT) + 1e-8)
-
+        X['efT_sq'] = efT**2
+        if etaT is not None:
+            X['efT_x_etaT'] = efT * etaT
     return X
 
-# ===== MMC4 Curve =====
-def mmc4_eta_epsf(eta, C):
-    # C = [C1..C6] 6개
-    C1, C2, C3, C4, C5, C6 = C
-    return (
-        C1
-        + C2 * eta
-        + C3 * (eta**2)
-        + C4 * (eta**3)
-        + C5 * np.exp(-eta)
-        + C6 * np.exp(eta)
-    )
+# ===== MMC4 수식/적합 (버튼 밖으로 빼서 session_state 재출력에도 동일 적용) =====
+def theta_bar(eta):
+    arg = -(27.0/2.0)*eta*(eta**2 - 1.0/3.0)
+    arg = np.clip(arg, -1.0, 1.0)
+    return 1.0 - (2.0/np.pi)*np.arccos(arg)
 
-def fit_mmc4_curve(points, init_C=None):
-    # points: list of (name, eta, epsf)
-    etas = np.array([p[1] for p in points], dtype=float)
-    epsf = np.array([p[2] for p in points], dtype=float)
+def c6_effective(eta, C6):
+    t = 1.0/np.sqrt(3.0)
+    return np.where((eta<=-t)|((eta>=0)&(eta<=t)),1.0,float(C6))
 
-    if init_C is None:
-        # 단순 초기값: 상수항=평균, 나머지=작게
-        init_C = np.array([float(np.mean(epsf)), 0.0, 0.0, 0.0, 0.0, 0.0], dtype=float)
+def mmc4_eps(eta, C):
+    C1,C2,C3,C4,C5,C6=C
+    tb=theta_bar(eta)
+    c6e=c6_effective(eta,C6)
+    k=np.sqrt(3.0)/(2.0-np.sqrt(3.0))
+    term1=(C1/C4)*( C5 + k*(c6e-C5)*(1.0/np.cos(tb*np.pi/6.0) - 1.0) )
+    base=1.0 + (C3**2)/3.0*np.cos(tb*np.pi/6.0) + C3*(eta + (1.0/3.0)*np.sin(tb*np.pi/6.0))
+    base=np.maximum(base,1e-6)
+    return term1 * ( base ** (-1.0/C2) )
 
-    def residual(C):
-        return mmc4_eta_epsf(etas, C) - epsf
+def fit_mmc4(etas, epss):
+    from scipy.optimize import least_squares
+    def resid(p): return mmc4_eps(etas,p)-epss
+    x0=np.array([1.0,1.0,0.2,1.0,0.6,0.8])
+    lb=np.array([0.001,0.10,-2.0,0.10,0.0,0.0])
+    ub=np.array([10.0,5.0,2.0,5.0,2.0,2.0])
+    res=least_squares(resid,x0,bounds=(lb,ub),max_nfev=5000,verbose=0)
+    return res.x
 
-    res = least_squares(residual, init_C, max_nfev=10000)
-    return res.x, res
-
-def smooth_curve_cubic(points, n=200):
-    # points: (name, eta, epsf) 정렬된 상태 가정
-    pts_sorted = sorted(points, key=lambda x: x[1])
-    xs = np.array([p[1] for p in pts_sorted], dtype=float)
-    ys = np.array([p[2] for p in pts_sorted], dtype=float)
-
-    # 기울기(단순 finite difference)
-    dydx = np.zeros_like(ys)
-    for i in range(len(xs)):
-        if i == 0:
-            dydx[i] = (ys[i+1] - ys[i]) / (xs[i+1] - xs[i] + 1e-8)
-        elif i == len(xs)-1:
-            dydx[i] = (ys[i] - ys[i-1]) / (xs[i] - xs[i-1] + 1e-8)
-        else:
-            dydx[i] = (ys[i+1] - ys[i-1]) / (xs[i+1] - xs[i-1] + 1e-8)
-
-    spline = CubicHermiteSpline(xs, ys, dydx)
-    x_new = np.linspace(xs.min(), xs.max(), n)
-    y_new = spline(x_new)
-    return x_new, y_new
-
-# ===== 입력 UI =====
-st.subheader("1) 입력 (Tension 기준 + 선택 입력)")
-
+# ===== 입력 폼 =====
+st.header("입력값(노란색)")
 c1, c2 = st.columns(2)
 with c1:
-    ys  = st.number_input("Yield Stress(MPa)", value=float(MEDIANS.get("Yield Stress(MPa)", 300.0)), format="%.5f")
-    uts = st.number_input("Ultimate Tensile Stress(MPa)", value=float(MEDIANS.get("Ultimate Tensile Stress(MPa)", 500.0)), format="%.5f")
+    ys  = st.number_input("Yield Stress(MPa)", value=float(MEDIANS.get("Yield Stress(MPa)", 200.0)))
+    uts = st.number_input("Ultimate Tensile Stress(MPa)", value=float(MEDIANS.get("Ultimate Tensile Stress(MPa)", 350.0)))
     tel = st.number_input("Total Elongation", value=float(MEDIANS.get("Total Elongation", 0.20)), format="%.5f")
 with c2:
     rv   = st.number_input("r-value", value=float(MEDIANS.get("r-value", 1.00)), format="%.5f")
-    etaT = st.number_input(
-        "Triaxiality(Tension)",
-        value=float(MEDIANS.get("Triaxiality(Tension)", 0.33)),
-        min_value=-0.5, max_value=0.7, step=0.01, format="%.2f"
-    )
-    efT  = st.number_input("Fracture strain(Tension)", value=float(MEDIANS.get("Fracture strain(Tension)", 0.20)), min_value=0.0, step=0.001, format="%.5f")
+    etaT = st.number_input("Triaxiality(Tension)", value=float(MEDIANS.get("Triaxiality(Tension)", 0.33)), min_value=-0.5, max_value=0.7, step=0.01, format="%.2f")
+    efT  = st.number_input("Fracture strain(Tension)", value=0.20, min_value=0.0, step=0.001, format="%.5f")
 
-extra_inputs = [
-    c for c in INPUTS
-    if c not in [
-        "Yield Stress(MPa)", "Ultimate Tensile Stress(MPa)", "Total Elongation", "r-value",
-        "Triaxiality(Tension)", "Fracture strain(Tension)"
-    ]
-]
+extra_inputs = [c for c in INPUTS if c not in ["Yield Stress(MPa)","Ultimate Tensile Stress(MPa)","Total Elongation","r-value","Triaxiality(Tension)","Fracture strain(Tension)"]]
 adv_vals = {}
 if len(extra_inputs) or len(CAT_INPUTS):
     with st.expander("고급 옵션", expanded=False):
@@ -227,10 +134,8 @@ if len(extra_inputs) or len(CAT_INPUTS):
             adv_vals[c] = st.number_input(c, value=float(MEDIANS.get(c, 0.0)))
 
 # ===== 예측 =====
-st.subheader("2) 예측 및 곡선 생성")
-
-if st.button("예측 실행"):
-    # 1) 입력 DF 생성
+if st.button("예측 및 MMC4 플롯"):
+    # 1) 입력 dict
     x_dict = {
         "Yield Stress(MPa)": ys,
         "Ultimate Tensile Stress(MPa)": uts,
@@ -257,12 +162,12 @@ if st.button("예측 실행"):
     # 3) 특징공학
     X_tmp = build_enhanced_features(x_one, INPUTS, CAT_INPUTS)
 
-    # 4) 스키마 정렬(모델 preprocessor가 기대하는 컬럼 확보)
-    pre = model.named_steps["pre"]
-    num_cols_model = list(next(t[2] for t in pre.transformers if t[0] == "num"))
+    # 4) 스키마 정렬
+    pre = model.named_steps['pre']
+    num_cols_model = list(next(t[2] for t in pre.transformers if t[0] == 'num'))
     cat_cols_model = []
     for name, trans, cols in pre.transformers:
-        if name == "cat" and cols is not None and cols != "drop":
+        if name == 'cat' and cols is not None and cols != 'drop':
             cat_cols_model = list(cols)
 
     for c in num_cols_model:
@@ -287,9 +192,9 @@ if st.button("예측 실행"):
     ef_notch  = y_hat.get("Fracture strain(Notch R05)")
     ef_bulge  = y_hat.get("Fracture strain(Punch Bulge)")
 
-    eta_tens  = etaT
-    ef_tens   = efT
-    eta_bulge = 2.0 / 3.0
+    eta_tens  = float(etaT)
+    ef_tens   = float(efT)
+    eta_bulge = 2.0/3.0  # 요구사항 반영: Bulge η는 타깃 제외, 상수 사용
 
     # 7) 누락 검사(정확 표기)
     missing = []
@@ -308,36 +213,94 @@ if st.button("예측 실행"):
         ("Notch",   float(eta_notch), float(ef_notch)),
         ("Bulge",   float(eta_bulge), float(ef_bulge)),
     ]
+    pts = sorted(pts, key=lambda t: t[1])
 
-    st.write("예측 결과(타깃 5개):")
-    st.dataframe(y_hat.to_frame("pred").T, use_container_width=True)
+    etas=np.array([p[1] for p in pts])
+    epss=np.array([p[2] for p in pts])
+    C_hat=fit_mmc4(etas,epss)
 
-    st.write("곡선 피팅에 사용되는 4점:")
-    st.dataframe(pd.DataFrame(pts, columns=["Case", "η", "εf"]), use_container_width=True)
+    # ===== [추가] 결과를 session_state에 저장해서, η_query 입력 시에도 결과가 유지되도록 처리 =====
+    st.session_state["mmc4_pts"] = pts
+    st.session_state["mmc4_C_hat"] = C_hat
 
-    # 8) MMC4 파라미터 피팅
-    C_opt, res = fit_mmc4_curve(pts)
-    st.write("최적화된 C (C1~C6):", C_opt)
+# ===== [추가] 저장된 결과가 있으면(한 번이라도 예측했으면) 계속 출력 + 특정 η 조회 기능 제공 =====
+if "mmc4_pts" in st.session_state and "mmc4_C_hat" in st.session_state:
+    pts = st.session_state["mmc4_pts"]
+    C_hat = st.session_state["mmc4_C_hat"]
 
-    # 9) 곡선 생성(η 범위는 4점 기준)
-    eta_min = min(p[1] for p in pts)
-    eta_max = max(p[1] for p in pts)
-    eta_grid = np.linspace(eta_min, eta_max, 300)
-    eps_grid = mmc4_eta_epsf(eta_grid, C_opt)
+    # ===== 플롯 =====
+    eta_lo, eta_hi = -0.1, 0.7
+    eta_grid = np.linspace(eta_lo, eta_hi, 200)
 
-    # 10) 스무딩 보조(시각화)
-    x_smooth, y_smooth = smooth_curve_cubic(pts, n=250)
+    eps_curve = mmc4_eps(eta_grid, C_hat)
 
-    # 11) Plot
-    fig = plt.figure(figsize=(7, 4))
-    plt.plot(eta_grid, eps_grid, label="MMC4 fit")
-    plt.plot(x_smooth, y_smooth, label="CubicHermite (guide)", linestyle="--")
-    plt.scatter([p[1] for p in pts], [p[2] for p in pts], zorder=5, label="Points")
-    for name, x, y in pts:
-        plt.text(x, y, f"  {name}", fontsize=9)
-    plt.xlabel("η (Triaxiality)")
-    plt.ylabel("εf (Fracture strain)")
-    plt.title("MMC4 Curve (fit by 4 points)")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    st.pyplot(fig, clear_figure=True)
+    etas = np.array([p[1] for p in pts])
+    eta_min = float(etas.min())
+    eta_max = float(etas.max())
+
+    e_min = float(mmc4_eps(eta_min, C_hat))
+    delta = eta_min - eta_lo
+    curv = abs(e_min) / (delta**2 + 1e-6) * 0.6
+
+    def left_curve(eta):
+        return e_min + curv * (eta - eta_min)**2
+
+    mask_left = eta_grid < eta_min
+    if np.any(mask_left):
+        eps_curve[mask_left] = left_curve(eta_grid[mask_left])
+
+    from scipy.interpolate import CubicHermiteSpline
+
+    h = 1e-4
+    def d_mmc4(e):
+        return float((mmc4_eps(e + h, C_hat) - mmc4_eps(e - h, C_hat)) / (2.0 * h))
+
+    e_max = float(mmc4_eps(eta_max, C_hat))
+    d_max = d_mmc4(eta_max)
+
+    y_hi = e_max + d_max * (eta_hi - eta_max)
+    right_conn = CubicHermiteSpline([eta_max, eta_hi], [e_max, y_hi], [d_max, d_max])
+
+    mask_right = eta_grid > eta_max
+    if np.any(mask_right):
+        eps_curve[mask_right] = right_conn(eta_grid[mask_right])
+
+    fig,ax=plt.subplots(figsize=(7,4.5))
+    ax.plot(eta_grid,eps_curve,lw=2,label="MMC4 curve (fit)")
+    for name,x,y in pts:
+        ax.scatter([x],[y],s=60,edgecolor="k",zorder=5,label=name)
+        ax.annotate(name,(x,y),xytext=(5,5),textcoords="offset points",fontsize=9)
+    ax.set_xlabel("Triaxiality (η)")
+    ax.set_ylabel("Fracture strain (εf)")
+    ax.set_xlim(eta_lo, eta_hi)
+    ax.set_ylim(0.0, float(next(y for name, _, y in pts if name == "Bulge")) + 0.3)
+    ax.set_title("MMC4 Curve")
+    ax.grid(True,alpha=0.3)
+    ax.legend()
+    st.pyplot(fig)
+
+    st.markdown("**4점 요약**")
+    for name,x,y in pts:
+        st.text(f"{name:8s} η={x:.4f}  εf={y:.5f}")
+    st.markdown("**적합 파라미터 C1~C6**")
+    st.text("C = [" + ", ".join(f"{v:.6f}" for v in C_hat) + "]")
+
+    st.markdown("**특정 η 입력 → εf 출력**")
+    eta_query = st.number_input(
+        "조회할 Triaxiality (η_query)",
+        value=float(np.clip((eta_lo + eta_hi) / 2.0, eta_lo, eta_hi)),
+        min_value=float(eta_lo),
+        max_value=float(eta_hi),
+        step=0.01,
+        format="%.5f",
+        key="mmc4_eta_query"
+    )
+
+    if eta_query < eta_min:
+        eps_query = float(left_curve(eta_query))
+    elif eta_query > eta_max:
+        eps_query = float(right_conn(eta_query))
+    else:
+        eps_query = float(mmc4_eps(eta_query, C_hat))
+
+    st.write(f"**결과:** η = {eta_query:.5f} 에서 **εf = {eps_query:.6f}** 입니다.")
