@@ -7,7 +7,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from openpyxl import load_workbook
-# import joblib  # ✅ pkl 저장 안 쓰므로 불필요
 
 from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
@@ -21,8 +20,6 @@ from sklearn.multioutput import MultiOutputRegressor
 # ===== 설정 =====
 DATA_XLSX = "250811_산학프로젝트_포스코의 워크시트.xlsx"
 SHEET_FALLBACK = "학습DB"
-RSEED = 20250821
-np.random.seed(RSEED)
 
 # ★ 타깃(총 5개): Notch 2 + Shear 2 + Bulge εf (Bulge η 제외)
 TARGETS_FIXED = [
@@ -84,9 +81,13 @@ def _as_series_single(X: pd.DataFrame, colname: str):
     return ser
 
 # =========================
-# ✅ 핵심: 원본 학습 로직을 함수로 감싸고 bundle 반환 (pkl 저장 제거)
+# ✅ 핵심: pkl 저장 없이 번들 반환. seed=None이면 매번 랜덤 학습
 # =========================
-def train_bundle(data_xlsx: str = DATA_XLSX, seed: int = RSEED):
+def train_bundle(data_xlsx: str = DATA_XLSX, seed: int | None = None):
+    # 매 시행 랜덤 학습
+    if seed is None:
+        seed = int(np.random.randint(0, 2**31 - 1))
+
     # ===== 데이터 로드 =====
     wb = load_workbook(data_xlsx, data_only=True)
     sheet_name = wb.sheetnames[0] if wb.sheetnames else SHEET_FALLBACK
@@ -244,23 +245,20 @@ def train_bundle(data_xlsx: str = DATA_XLSX, seed: int = RSEED):
     metrics = compute_metrics(y_test, y_pred)
 
     print("\n=== 학습 요약 ===")
+    print(f"seed = {seed}")
     print(f"출력 타깃(5개 예상): {list(y_all.columns)}")
     print(f"전체 평탄화 R² = {r2_flat:.6f}")
-    for k, v in metrics.items():
-        print(f"{k:32s}  R²={v['R2']:7.4f}  MAE={v['MAE']:8.5f}  MAPE={v['MAPE']:6.2f}%")
 
-    # ===== meta 구성(원본 그대로) =====
     meta = {
         "input_cols": input_cols,
         "cat_inputs": cat_inputs,
-        "output_cols": list(y_all.columns),     # 5 타깃
+        "output_cols": list(y_all.columns),
         "num_medians": df[input_cols].apply(pd.to_numeric, errors="coerce").median(numeric_only=True).to_dict(),
-        "feature_columns": list(X_all.columns)
+        "feature_columns": list(X_all.columns),
+        "seed": seed
     }
 
-    # ✅ pkl 저장 제거, 즉시 반환
     return {"model": pipe, "meta": meta, "metrics": metrics, "r2_flat": r2_flat}
 
 if __name__ == "__main__":
-    # 단독 실행 시에도 pkl 저장 없이 학습만 수행
     train_bundle()
