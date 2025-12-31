@@ -6,10 +6,10 @@ app.py — 엑셀에서 바로 학습해서 MMC4 curve를 그려주는 Streamlit
 - 앱 실행 시 엑셀에서 바로 학습하고, 그 모델로 MMC4 곡선 도식화
 
 요구사항 반영:
-- Shear 이전~Bulge 이전(η <= 2/3): 보간 없이 MMC4 그대로
-- Bulge 이후(η > 2/3): 업로드한 app_mmc4_compact.py의 우측 Hermite 외삽 로직 "그대로" 적용
-- random_state 고정하지 않음(매 학습 랜덤)
-  * 단, Streamlit cache 때문에 "재학습" 버튼으로 cache clear 후 rerun 권장
+1) Shear 이전~Bulge 이전(η <= 2/3): 보간/외삽 없이 MMC4 그대로 플롯
+2) Bulge 이후(η > 2/3): 업로드 원본(app_mmc4_compact.py)의 우측 Hermite 외삽 로직 "그대로" 적용
+3) 특정 η(삼축응력값) 입력 → εf 출력 UI 추가 (스크린샷과 동일 형태)
+4) 모델은 random_state 고정하지 않음(매 재학습은 랜덤). 다만 Streamlit cache가 있으므로 버튼으로 재학습 트리거 제공
 """
 
 import warnings
@@ -36,7 +36,9 @@ from scipy.optimize import least_squares
 from scipy.interpolate import CubicHermiteSpline
 
 
-# ===== 기본 설정 =====
+# =========================
+# 기본 설정
+# =========================
 DATA_XLSX = "250811_산학프로젝트_포스코의 워크시트.xlsx"  # 같은 폴더에 두기
 SHEET_FALLBACK = "학습DB"
 
@@ -50,24 +52,32 @@ TARGETS_FIXED = [
 # Tension η, εf 는 항상 "입력"으로 사용
 FORCE_INPUT = {"Triaxiality(Tension)", "Fracture strain(Tension)"}
 
+# Bulge η 상수
+ETA_BULGE = 2.0 / 3.0
+
+# 플롯 범위(요구사항)
+ETA_LO, ETA_HI = -0.1, 0.7
+
 st.set_page_config(page_title="MMC4 Predictor", layout="wide")
 st.title("POSCO MMC4 — 모델 예측 기반 MMC4 곡선 시각화")
 
 
-# ===== (중요) 매번 랜덤 재학습 버튼 =====
+# =========================
+# (중요) 랜덤 재학습 트리거
+# =========================
 st.sidebar.header("학습")
-st.sidebar.caption("random_state=None이더라도 Streamlit 캐시가 있으면 동일 모델이 유지될 수 있습니다.")
-if st.sidebar.button("모델 다시 학습(랜덤)"):
-    # cache clear → rerun 시 엑셀에서 재학습
-    try:
-        load_and_train.clear()  # noqa: F821 (아래 정의됨)
-    except Exception:
-        pass
-    st.rerun()
+st.sidebar.caption("random_state=None이더라도 Streamlit cache가 남아있으면 같은 모델이 유지될 수 있습니다.")
+
+# load_and_train()는 아래에 정의되므로, 버튼은 "placeholder"로만 두고,
+# 실제 clear는 아래에서 load_and_train 정의 후에 처리해도 되지만,
+# Streamlit은 스크립트를 위에서 아래로 실행하므로, 여기서는 버튼 상태만 저장해 둡니다.
+do_retrain = st.sidebar.button("모델 다시 학습(랜덤)")
 
 
-# ===== 엑셀/색상 기반 유틸 =====
-def read_excel_safe(path):
+# =========================
+# 엑셀/색상 기반 유틸
+# =========================
+def read_excel_safe(path: str) -> pd.DataFrame:
     ext = Path(path).suffix.lower()
     try:
         if ext in [".xlsx", ".xlsm", ".xltx", ".xltm"]:
@@ -140,7 +150,9 @@ def _as_series_single(X: pd.DataFrame, colname: str):
     return ser
 
 
-# ===== 특징공학 =====
+# =========================
+# 특징공학
+# =========================
 def build_enhanced_features(df_, input_cols, cat_inputs):
     X = df_[input_cols + cat_inputs].copy()
 
@@ -188,7 +200,9 @@ def build_enhanced_features(df_, input_cols, cat_inputs):
     return X
 
 
-# ===== 모델 학습 (엑셀 → 파이프라인) =====
+# =========================
+# 모델 학습 (엑셀 → 파이프라인)
+# =========================
 @st.cache_resource
 def load_and_train():
     if not os.path.exists(DATA_XLSX):
@@ -300,7 +314,15 @@ def load_and_train():
     return pipe, meta
 
 
-# ===== 모델 로드/학습 호출 =====
+# 버튼이 눌렸으면 cache clear → rerun
+if do_retrain:
+    load_and_train.clear()
+    st.rerun()
+
+
+# =========================
+# 모델 로드/학습 호출
+# =========================
 try:
     model, meta = load_and_train()
 except Exception as e:
@@ -313,7 +335,9 @@ OUTPUTS = meta["output_cols"]
 MEDIANS = meta.get("num_medians", {})
 
 
-# ===== 입력 폼 =====
+# =========================
+# 입력 폼
+# =========================
 st.header("입력값(노란색)")
 c1, c2 = st.columns(2)
 with c1:
@@ -366,7 +390,9 @@ if len(extra_inputs) or len(CAT_INPUTS):
             )
 
 
-# ===== MMC4 수식 관련 함수 =====
+# =========================
+# MMC4 수식 관련 함수
+# =========================
 def theta_bar(eta):
     eta = np.asarray(eta, dtype=float)
     arg = -(27.0 / 2.0) * eta * (eta ** 2 - 1.0 / 3.0)
@@ -421,7 +447,9 @@ def fit_mmc4(etas, epss):
     return res.x
 
 
-# ===== 예측 및 플롯 =====
+# =========================
+# 예측 및 플롯
+# =========================
 if st.button("예측 및 MMC4 플롯"):
     # (1) 입력 한 줄 만들기
     x_dict = {
@@ -484,7 +512,7 @@ if st.button("예측 및 MMC4 플롯"):
 
     eta_tens  = float(etaT)
     ef_tens   = float(efT)
-    eta_bulge = 2.0 / 3.0   # 이론값 고정
+    eta_bulge = ETA_BULGE
 
     missing = []
     if eta_shear is None: missing.append("η(Shear)")
@@ -508,9 +536,8 @@ if st.button("예측 및 MMC4 플롯"):
     epss = np.array([p[2] for p in pts])
     C_hat = fit_mmc4(etas, epss)
 
-    # (7) 플롯: Shear 이전~Bulge 이전은 MMC4 그대로, Bulge 이후는 업로드 원본의 우측 Hermite 로직
-    eta_lo, eta_hi = -0.1, 0.7
-    eta_grid = np.linspace(eta_lo, eta_hi, 300)
+    # (7) 플롯: Shear 이전~Bulge 이전은 MMC4 그대로, Bulge 이후는 원본 우측 Hermite 로직
+    eta_grid = np.linspace(ETA_LO, ETA_HI, 300)
     eps_curve = mmc4_eps(eta_grid, C_hat)
 
     # 업로드 원본(app_mmc4_compact.py) 우측 외삽 로직 "그대로"
@@ -518,12 +545,11 @@ if st.button("예측 및 MMC4 플롯"):
     def d_mmc4(e):
         return float((mmc4_eps(e + h, C_hat) - mmc4_eps(e - h, C_hat)) / (2.0 * h))
 
-    # Bulge(η=2/3) 기준으로 우측을 Hermite로 연결
     e_max = float(mmc4_eps(eta_bulge, C_hat))
     d_max = d_mmc4(eta_bulge)
 
-    y_hi = e_max + d_max * (eta_hi - eta_bulge)
-    right_conn = CubicHermiteSpline([eta_bulge, eta_hi], [e_max, y_hi], [d_max, d_max])
+    y_hi = e_max + d_max * (ETA_HI - eta_bulge)
+    right_conn = CubicHermiteSpline([eta_bulge, ETA_HI], [e_max, y_hi], [d_max, d_max])
 
     mask_right = eta_grid > eta_bulge
     if np.any(mask_right):
@@ -543,15 +569,38 @@ if st.button("예측 및 MMC4 플롯"):
     ax.set_xlabel("Triaxiality (η)")
     ax.set_ylabel("Fracture strain (εf)")
     ax.set_title("MMC4 Curve")
-    ax.set_xlim(eta_lo, eta_hi)
+    ax.set_xlim(ETA_LO, ETA_HI)
     ax.set_ylim(0.0, float(ef_bulge) + 0.3)
     ax.grid(True, alpha=0.3)
     ax.legend()
     st.pyplot(fig)
 
+    # ===== 텍스트 출력(스크린샷 형태) =====
     st.markdown("**4점 요약**")
     for name, x, y in pts:
         st.text(f"{name:8s} η={x:.4f}  εf={y:.5f}")
 
     st.markdown("**적합 파라미터 C1~C6**")
     st.text("C = [" + ", ".join(f"{v:.6f}" for v in C_hat) + "]")
+
+    # ===== 특정 η 입력 → εf 출력 (스크린샷과 동일 UI/문구) =====
+    st.markdown("**특정 η 입력 → εf 출력**")
+
+    eta_query = st.number_input(
+        "조회할 Triaxiality (η_query)",
+        value=0.30000,
+        min_value=float(ETA_LO),
+        max_value=float(ETA_HI),
+        step=0.01,
+        format="%.5f"
+    )
+
+    # 조회 규칙:
+    # - Bulge 이전(η <= 2/3): MMC4 그대로
+    # - Bulge 이후(η > 2/3): 원본 우측 Hermite 외삽 right_conn 사용
+    if eta_query <= eta_bulge:
+        eps_query = float(mmc4_eps(eta_query, C_hat))
+    else:
+        eps_query = float(right_conn(eta_query))
+
+    st.write(f"결과: η = {eta_query:.5f} 에서 εf = {eps_query:.6f} 입니다.")
