@@ -1,159 +1,78 @@
 # -*- coding: utf-8 -*-
-"""
-train_export_model.py
-
-목표:
-- Streamlit 앱에서 실행 시점에 모델을 학습(또는 재학습)할 수 있도록,
-  "학습 함수" 형태로 제공.
-- pkl 저장은 기본적으로 하지 않음(옵션으로만 지원).
-
-학습 개요:
-- 입력: (기본) POSCO 워크시트 파일 또는 사용자가 업로드한 파일(CSV/XLSX)
-- 타깃(5개): Notch 2 + Shear 2 + Bulge εf (Bulge η는 학습에서 제외)
-- 특징공학: app_mmc4_compact.py와 동일한 파생피처 생성
-- 모델: ExtraTrees 기반 MultiOutputRegressor + (수치)결측 중앙값 대체 + (범주)OHE
-"""
-
-from __future__ import annotations
-
-import os
-import warnings
-from dataclasses import dataclass
-from io import BytesIO
-from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
-
-import numpy as np
-import pandas as pd
-
-from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import ExtraTreesRegressor
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.multioutput import MultiOutputRegressor
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
-
+# train_export_model.py — Bulge η 제외, Tension η·εf은 입력, 5타깃 학습
+import os, warnings
 warnings.filterwarnings("ignore")
 
-# =========================
-# 기본 설정
-# =========================
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from openpyxl import load_workbook
+import joblib
 
-# 기본 데이터 파일(리포지토리에 포함되어 있을 때 자동 사용)
-DEFAULT_DATA_PATH = "250811_산학프로젝트_포스코의 워크시트.xlsx"
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.ensemble import ExtraTreesRegressor
+from sklearn.multioutput import MultiOutputRegressor
 
-# 타깃(총 5개): Notch 2 + Shear 2 + Bulge εf (Bulge η 제외)
-TARGETS_FIXED: List[str] = [
+# ===== 설정 =====
+DATA_XLSX = "250811_산학프로젝트_포스코의 워크시트.xlsx"
+SHEET_FALLBACK = "학습DB"
+RSEED = 20250821
+np.random.seed(RSEED)
+
+# ★ 타깃(총 5개): Notch 2 + Shear 2 + Bulge εf (Bulge η 제외)
+TARGETS_FIXED = [
     "Triaxiality(Notch R05)",     "Fracture strain(Notch R05)",
     "Triaxiality(Shear0)",        "Fracture strain(Shear0)",
     "Fracture strain(Punch Bulge)"
 ]
 
-# Tension η·εf는 "항상 입력으로 간주"
+# ★ 입력 화이트리스트: Tension의 η, εf은 항상 입력(노란값)
 FORCE_INPUT = {"Triaxiality(Tension)", "Fracture strain(Tension)"}
 
-# 기본적으로 우선 포함하고 싶은 입력(존재하면 우선 정렬)
-PREFERRED_INPUTS_ORDER: List[str] = [
-    "Yield Stress(MPa)",
-    "Ultimate Tensile Stress(MPa)",
-    "Total Elongation",
-    "r-value",
-    "Triaxiality(Tension)",
-    "Fracture strain(Tension)",
-]
-
-DEFAULT_CAT_INPUTS: List[str] = ["Material"]  # 존재할 때만 사용
-
-
-# =========================
-# 데이터 로드 유틸
-# =========================
-
-def load_dataframe_from_bytes(data: bytes, filename: str) -> pd.DataFrame:
-    """Streamlit 업로드 bytes를 DataFrame으로 변환(CSV/XLSX 지원)."""
-    suffix = Path(filename).suffix.lower()
-    bio = BytesIO(data)
-
-    if suffix in [".csv", ".txt"]:
-        return pd.read_csv(bio)
-    if suffix in [".xlsx", ".xlsm", ".xltx", ".xltm", ".xls"]:
-        return pd.read_excel(bio)
-
-    # 확장자가 애매하면 excel → csv 순으로 시도
+# ===== 유틸 =====
+def read_excel_safe(path):
+    ext = Path(path).suffix.lower()
     try:
-        return pd.read_excel(bio)
+        if ext in [".xlsx", ".xlsm", ".xltx", ".xltm"]:
+            return pd.read_excel(path, engine="openpyxl")
+        elif ext == ".xls":
+            return pd.read_excel(path, engine="xlrd")
+        elif ext == ".xlsb":
+            return pd.read_excel(path, engine="pyxlsb")
     except Exception:
-        bio.seek(0)
-        return pd.read_csv(bio)
-
-
-def load_dataframe_from_path(path: Union[str, Path]) -> pd.DataFrame:
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Data file not found: {path}")
-    suffix = path.suffix.lower()
-    if suffix in [".csv", ".txt"]:
-        return pd.read_csv(path)
+        pass
     return pd.read_excel(path)
 
+def rgb_from_cell(cell):
+    try:
+        fill = cell.fill
+        if fill is None or fill.fill_type is None: return None
+        rgb = None
+        if hasattr(fill, "fgColor") and getattr(fill.fgColor, "type", None) == "rgb":
+            rgb = fill.fgColor.rgb
+        if (rgb is None or rgb == "00000000") and hasattr(fill, "start_color"):
+            rgb = getattr(fill.start_color, "rgb", None)
+        if rgb is None: return None
+        rgb = rgb.replace("0x","").replace("#","")
+        if len(rgb)==8: rgb = rgb[2:]
+        return rgb.upper() if len(rgb)==6 else None
+    except:
+        return None
 
-# =========================
-# 컬럼 추정 / 정리
-# =========================
+def classify_rgb(rgb):
+    if not rgb: return None
+    r = int(rgb[0:2],16); g = int(rgb[2:4],16); b = int(rgb[4:6],16)
+    if r>=200 and g>=200 and b<=120: return "yellow"   # 입력
+    if r<=180 and g>=170 and b>=190: return "skyblue"  # 출력
+    return None
 
-def infer_input_and_targets(df: pd.DataFrame) -> Tuple[List[str], List[str], List[str]]:
-    """
-    df에서 input_cols(수치), cat_inputs(범주), output_cols(타깃)을 추정.
-
-    정책:
-    - 타깃은 TARGETS_FIXED 중 df에 존재하는 것만 사용
-    - 입력은 "수치형 컬럼 - 타깃"을 기본으로 하되 FORCE_INPUT은 반드시 포함
-    - 범주 입력은 DEFAULT_CAT_INPUTS 중 존재하는 것만 사용
-    """
-    cat_inputs = [c for c in DEFAULT_CAT_INPUTS if c in df.columns]
-
-    output_cols = [c for c in TARGETS_FIXED if c in df.columns]
-    if len(output_cols) == 0:
-        raise ValueError(
-            "타깃 컬럼을 찾지 못했습니다. 데이터에 다음 컬럼 중 일부가 있어야 합니다:\n"
-            + "\n".join(TARGETS_FIXED)
-        )
-
-    # numeric 후보: to_numeric 후 유효값이 1개라도 있는 컬럼
-    numeric_cols: List[str] = []
-    for c in df.columns:
-        if c in cat_inputs:
-            continue
-        s = pd.to_numeric(df[c], errors="coerce")
-        if np.isfinite(s).sum() > 0:
-            numeric_cols.append(c)
-
-    input_cols = [c for c in numeric_cols if c not in output_cols]
-
-    # FORCE_INPUT 강제 반영
-    for c in FORCE_INPUT:
-        if c in df.columns and c not in input_cols and c not in output_cols:
-            input_cols.append(c)
-        if c in output_cols:
-            output_cols = [t for t in output_cols if t != c]
-            if c not in input_cols:
-                input_cols.append(c)
-
-    # 입력을 선호 순서로 정렬
-    ordered = [c for c in PREFERRED_INPUTS_ORDER if c in input_cols]
-    rest = [c for c in input_cols if c not in ordered]
-    input_cols = ordered + sorted(rest)
-
-    return input_cols, cat_inputs, output_cols
-
-
-# =========================
-# 특징공학 (앱과 동일 로직)
-# =========================
-
-def _as_series_single(X: pd.DataFrame, colname: str) -> Optional[pd.Series]:
-    """동일 이름 중복 컬럼이 있어도 단일 Series로 축약(왼쪽→오른쪽 첫 유효값)."""
+def _as_series_single(X: pd.DataFrame, colname: str):
+    """중복 컬럼이 있어도 단일 Series로 축약(왼쪽→오른쪽 첫 유효값)."""
     if colname not in X.columns:
         return None
     cols = [c for c in X.columns if c == colname]
@@ -164,220 +83,183 @@ def _as_series_single(X: pd.DataFrame, colname: str) -> Optional[pd.Series]:
     ser = sub_num.bfill(axis=1).iloc[:, 0]
     return ser
 
-
-def build_enhanced_features(df_: pd.DataFrame, input_cols: Sequence[str], cat_inputs: Sequence[str]) -> pd.DataFrame:
-    """원본 입력(input_cols + cat_inputs)에서 파생 피처를 추가한 DataFrame 반환."""
-    X = df_[list(input_cols) + list(cat_inputs)].copy()
-
-    ys = _as_series_single(X, "Yield Stress(MPa)")
-    uts = _as_series_single(X, "Ultimate Tensile Stress(MPa)")
-    tel = _as_series_single(X, "Total Elongation")
-    rv = _as_series_single(X, "r-value")
-    etaT = _as_series_single(X, "Triaxiality(Tension)")
-    efT = _as_series_single(X, "Fracture strain(Tension)")
-
-    # 강도 파생
-    if uts is not None and ys is not None:
-        X["UTS_to_Yield"] = uts / (ys + 1e-8)
-        X["Strength_Range"] = uts - ys
-
-    # 연신 파생
-    if tel is not None:
-        X["Elong_sq"] = tel ** 2
-        X["Elong_sqrt"] = np.sqrt(tel + 1e-8)
-        if rv is not None:
-            X["Elong_x_r"] = tel * rv
-            X["Elong_div_r"] = tel / (rv + 1e-8)
-
-    # Tension η, εf 파생
-    if etaT is not None:
-        X["etaT_sq"] = etaT ** 2
-        X["etaT_abs"] = np.abs(etaT)
-    if efT is not None:
-        X["efT_sq"] = efT ** 2
-        X["log_efT"] = np.log(efT + 1e-8)
-
-    # 상호작용(있을 때만)
-    if etaT is not None and efT is not None:
-        X["etaT_x_efT"] = etaT * efT
-        X["efT_div_etaT"] = efT / (np.abs(etaT) + 1e-8)
-
-    return X
-
-
-def align_features_for_model(X_raw: pd.DataFrame, feature_columns: Sequence[str], fill_value: float = np.nan) -> pd.DataFrame:
-    """학습 시 feature_columns 스키마에 맞춰 컬럼 보강/정렬."""
-    X = X_raw.copy()
-    for c in feature_columns:
-        if c not in X.columns:
-            X[c] = fill_value
-    return X[list(feature_columns)]
-
-
 # =========================
-# 학습
+# ✅ 핵심: 학습을 "함수"로 감싸고 bundle을 반환
 # =========================
+def train_bundle(data_xlsx: str = DATA_XLSX, seed: int = RSEED):
+    # ===== 데이터 로드 =====
+    wb = load_workbook(data_xlsx, data_only=True)
+    sheet_name = wb.sheetnames[0] if wb.sheetnames else SHEET_FALLBACK
+    ws = wb[sheet_name]
+    df = read_excel_safe(data_xlsx)
+    df = df.dropna(axis=1, how="all")
 
-@dataclass(frozen=True)
-class TrainResult:
-    model: Pipeline
-    meta: Dict
-    metrics: Dict[str, Dict[str, float]]
-    r2_flat: float
+    # ===== 입력/출력 식별 =====
+    headers, classes = [], []
+    for col in range(1, ws.max_column+1):
+        cell = ws.cell(row=1, column=col)
+        headers.append(cell.value)
+        classes.append(classify_rgb(rgb_from_cell(cell)))
 
+    input_cols, output_cols = [], []
+    for name, cls in zip(headers, classes):
+        if name in df.columns:
+            if cls == "yellow":   input_cols.append(name)
+            elif cls == "skyblue": output_cols.append(name)
 
-def _make_ohe():
-    try:
-        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
-    except TypeError:
-        return OneHotEncoder(handle_unknown="ignore", sparse=False)
+    # 패턴 보조
+    def infer_by_name(columns):
+        in_pats = ["yield","ultimate","elongation","r-value","tension","입력","input"]
+        out_pats= ["notch","shear","bulge","punch","fracture","triaxiality","예측","output"]
+        ins, outs = [], []
+        for c in columns:
+            cl = str(c).lower()
+            if any(p in cl for p in in_pats): ins.append(c)
+            if any(p in cl for p in out_pats): outs.append(c)
+        return ins, outs
 
+    if len(output_cols) == 0:
+        inf_in, inf_out = infer_by_name(list(df.columns))
+        output_cols = [c for c in inf_out if pd.api.types.is_numeric_dtype(df[c])]
+        input_cols = [c for c in df.columns if c not in output_cols and pd.api.types.is_numeric_dtype(df[c])]
 
-def train_model(
-    df: pd.DataFrame,
-    *,
-    input_cols: Optional[Sequence[str]] = None,
-    cat_inputs: Optional[Sequence[str]] = None,
-    output_cols: Optional[Sequence[str]] = None,
-    test_size: float = 0.25,
-    random_state: int = 42,
-    n_estimators: int = 300,
-) -> TrainResult:
-    """DataFrame으로부터 모델 학습 후 (model, meta, metrics) 반환."""
-    if input_cols is None or cat_inputs is None or output_cols is None:
-        inf_in, inf_cat, inf_out = infer_input_and_targets(df)
-        input_cols = list(inf_in) if input_cols is None else list(input_cols)
-        cat_inputs = list(inf_cat) if cat_inputs is None else list(cat_inputs)
-        output_cols = list(inf_out) if output_cols is None else list(output_cols)
+    cat_inputs = ['Material'] if 'Material' in df.columns else []
 
-    # 숫자 변환
-    for col in set(list(input_cols) + list(output_cols)):
-        if col in df.columns:
+    # ★ tension 입력 화이트리스트 강제 반영
+    for c in list(df.columns):
+        if c in FORCE_INPUT:
+            if c in output_cols:
+                output_cols.remove(c)
+            if pd.api.types.is_numeric_dtype(df[c]) and c not in input_cols:
+                input_cols.append(c)
+
+    # ★ 타깃은 TARGETS_FIXED(존재하는 것만)로 확정
+    output_cols = [c for c in TARGETS_FIXED if c in df.columns]
+
+    # 숫자 변환(학습 사용 컬럼만)
+    for col in set(input_cols + output_cols):
+        try:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+        except Exception:
+            pass
 
-    # 타깃 결측 제거
-    df_model = df.dropna(subset=list(output_cols)).reset_index(drop=True)
-    if len(df_model) < 10:
-        raise ValueError(f"학습 가능한 행이 너무 적습니다. (타깃 결측 제거 후 n={len(df_model)})")
+    # ===== 특징공학 =====
+    def build_enhanced_features(df_):
+        X = df_[input_cols + cat_inputs].copy()
 
-    X_all = build_enhanced_features(df_model, input_cols, cat_inputs)
-    y_all = df_model[list(output_cols)].copy()
+        ys  = _as_series_single(X, 'Yield Stress(MPa)')
+        uts = _as_series_single(X, 'Ultimate Tensile Stress(MPa)')
+        tel = _as_series_single(X, 'Total Elongation')
+        rv  = _as_series_single(X, 'r-value')
+        etaT= _as_series_single(X, 'Triaxiality(Tension)')
+        efT = _as_series_single(X, 'Fracture strain(Tension)')
 
-    from sklearn.model_selection import train_test_split
+        if uts is not None and ys is not None:
+            X['UTS_to_Yield']   = uts / (ys + 1e-8)
+            X['Strength_Range'] = uts - ys
+        if tel is not None:
+            X['Elong_sq'] = tel**2
+            X['Elong_sqrt'] = np.sqrt(tel + 1e-8)
+            if rv is not None:
+                X['Elong_x_r']   = tel * rv
+                X['Elong_div_r'] = tel / (rv + 1e-8)
+        if etaT is not None:
+            X['etaT_sq']   = etaT**2
+            X['etaT_cube'] = etaT**3
+            if tel is not None:
+                X['Total Elongation_x_Triaxiality(Tension)'] = tel * etaT
+            if rv is not None:
+                X['r-value_x_Triaxiality(Tension)'] = rv * etaT
+        if rv is not None:
+            X['r_sq']  = rv**2
+            X['r_log'] = np.log(rv + 1e-8)
+        if efT is not None:
+            X['efT_sq'] = efT**2
+            if etaT is not None:
+                X['efT_x_etaT'] = efT * etaT
+
+        # 상호작용
+        key = [('Total Elongation', tel), ('r-value', rv), ('Triaxiality(Tension)', etaT)]
+        for i in range(len(key)):
+            for j in range(i+1, len(key)):
+                n1,s1 = key[i]; n2,s2 = key[j]
+                if s1 is not None and s2 is not None:
+                    X[f'{n1}_x_{n2}'] = s1 * s2
+        return X
+
+    # ===== 모델 데이터 =====
+    needed = list(dict.fromkeys(input_cols + cat_inputs + output_cols))
+    df_model = df[needed].copy()
+    df_model = df_model.dropna(subset=[c for c in output_cols if c in df_model.columns], how="any")
+
+    X_all = build_enhanced_features(df_model)
+    y_all = df_model[[c for c in output_cols if c in df_model.columns]].copy()
+
+    # 분할
     X_train, X_test, y_train, y_test = train_test_split(
-        X_all, y_all, test_size=float(test_size), random_state=int(random_state), shuffle=True
+        X_all, y_all, test_size=0.25, random_state=seed, shuffle=True
     )
 
+    # ===== 파이프라인 =====
     num_cols = [c for c in X_all.columns if c not in cat_inputs]
+    try:
+        ohe = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
+    except TypeError:
+        ohe = OneHotEncoder(handle_unknown='ignore', sparse=False)
+
     pre = ColumnTransformer(
         transformers=[
-            ("num", SimpleImputer(strategy="median"), num_cols),
-            ("cat", _make_ohe(), list(cat_inputs)),
+            ('num', SimpleImputer(strategy='median'), num_cols),
+            ('cat', ohe, cat_inputs)
         ],
-        remainder="drop",
-        verbose_feature_names_out=False,
+        remainder='drop'
     )
 
-    def _create_et():
+    def create_et():
         return ExtraTreesRegressor(
-            n_estimators=int(n_estimators),
-            max_depth=None,
-            max_features="sqrt",
-            bootstrap=True,
-            random_state=int(random_state),
-            n_jobs=-1,
+            n_estimators=300, max_depth=None, max_features='sqrt',
+            bootstrap=True, random_state=seed, n_jobs=-1
         )
 
     pipe = Pipeline([
-        ("pre", pre),
-        ("reg", MultiOutputRegressor(_create_et())),
+        ('pre', pre),
+        ('reg', MultiOutputRegressor(create_et()))
     ])
 
     pipe.fit(X_train, y_train)
 
     # 메트릭
-    y_pred = pd.DataFrame(pipe.predict(X_test), columns=y_test.columns, index=y_test.index)
-
-    def compute_metrics(y_true: pd.DataFrame, y_hat: pd.DataFrame) -> Dict[str, Dict[str, float]]:
-        out: Dict[str, Dict[str, float]] = {}
+    def compute_metrics(y_true, y_hat):
+        d = {}
         for c in y_true.columns:
-            yt = y_true[c].astype(float).values
-            yp = y_hat[c].astype(float).values
-            out[c] = {
-                "R2": float(r2_score(yt, yp)),
-                "MAE": float(mean_absolute_error(yt, yp)),
-                "MAPE": float(np.mean(np.abs((yt - yp) / (yt + 1e-8))) * 100.0),
+            d[c] = {
+                "R2":  float(r2_score(y_true[c], y_hat[c])),
+                "MAE": float(mean_absolute_error(y_true[c], y_hat[c])),
+                "MAPE": float(np.mean(np.abs((y_true[c]-y_hat[c])/(y_true[c]+1e-8))) * 100),
             }
-        return out
+        return d
 
+    y_pred = pd.DataFrame(pipe.predict(X_test), columns=y_test.columns, index=y_test.index)
     r2_flat = float(r2_score(y_test.values.flatten(), y_pred.values.flatten()))
     metrics = compute_metrics(y_test, y_pred)
 
-    meta = {
-        "input_cols": list(input_cols),
-        "cat_inputs": list(cat_inputs),
-        "output_cols": list(output_cols),
-        "num_medians": df_model[list(input_cols)].median(numeric_only=True).to_dict() if len(input_cols) else {},
-        "feature_columns": list(X_all.columns),
-        "train_rows": int(len(df_model)),
-        "test_size": float(test_size),
-        "random_state": int(random_state),
-        "n_estimators": int(n_estimators),
-        "r2_flat": float(r2_flat),
-    }
-
-    return TrainResult(model=pipe, meta=meta, metrics=metrics, r2_flat=r2_flat)
-
-
-def train_bundle_from_path(
-    path: Union[str, Path],
-    *,
-    test_size: float = 0.25,
-    random_state: int = 42,
-    n_estimators: int = 300,
-) -> Dict:
-    df = load_dataframe_from_path(path)
-    res = train_model(df, test_size=test_size, random_state=random_state, n_estimators=n_estimators)
-    return {"model": res.model, "meta": res.meta, "metrics": res.metrics, "r2_flat": res.r2_flat}
-
-
-def train_bundle_from_bytes(
-    data: bytes,
-    filename: str,
-    *,
-    test_size: float = 0.25,
-    random_state: int = 42,
-    n_estimators: int = 300,
-) -> Dict:
-    df = load_dataframe_from_bytes(data, filename)
-    res = train_model(df, test_size=test_size, random_state=random_state, n_estimators=n_estimators)
-    return {"model": res.model, "meta": res.meta, "metrics": res.metrics, "r2_flat": res.r2_flat}
-
-
-# =========================
-# (옵션) 로컬 CLI 실행
-# =========================
-
-def _print_metrics(metrics: Dict[str, Dict[str, float]], r2_flat: float) -> None:
     print("\n=== 학습 요약 ===")
+    print(f"출력 타깃(5개 예상): {list(y_all.columns)}")
     print(f"전체 평탄화 R² = {r2_flat:.6f}")
     for k, v in metrics.items():
-        print(f"{k:32s}  R²={v['R2']:7.4f}  MAE={v['MAE']:10.6f}  MAPE={v['MAPE']:7.2f}%")
+        print(f"{k:32s}  R²={v['R2']:7.4f}  MAE={v['MAE']:8.5f}  MAPE={v['MAPE']:6.2f}%")
+
+    # ===== 저장(meta)는 그대로 구성하되, pkl dump는 제거하고 반환 =====
+    meta = {
+        "input_cols": input_cols,
+        "cat_inputs": cat_inputs,
+        "output_cols": list(y_all.columns),     # 5 타깃
+        "num_medians": df[input_cols].apply(pd.to_numeric, errors="coerce").median(numeric_only=True).to_dict(),
+        "feature_columns": list(X_all.columns)
+    }
+    return {"model": pipe, "meta": meta, "metrics": metrics, "r2_flat": r2_flat}
 
 
+# (선택) 이 파일을 단독 실행할 때만 학습 돌리도록 유지
 if __name__ == "__main__":
-    data_path = os.environ.get("MMC4_DATA_PATH", DEFAULT_DATA_PATH)
-    test_size = float(os.environ.get("MMC4_TEST_SIZE", "0.25"))
-    n_estimators = int(os.environ.get("MMC4_N_ESTIMATORS", "300"))
-    random_state = int(os.environ.get("MMC4_RANDOM_STATE", "42"))
-
-    bundle = train_bundle_from_path(
-        data_path, test_size=test_size, random_state=random_state, n_estimators=n_estimators
-    )
-    _print_metrics(bundle["metrics"], bundle["r2_flat"])
-
-    # pkl 저장은 기본 OFF (원하면 환경변수로 켜기)
-    if os.environ.get("MMC4_SAVE_PKL", "0") == "1":
-        import joblib
-        joblib.dump({"model": bundle["model"], "meta": bundle["meta"]}, "mmc4_model.pkl", compress=7)
-        print("\nSaved: mmc4_model.pkl")
+    train_bundle()
