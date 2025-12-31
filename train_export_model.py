@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from openpyxl import load_workbook
-import joblib
+# import joblib  # ✅ pkl 저장 안 쓰므로 불필요
 
 from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
@@ -84,7 +84,7 @@ def _as_series_single(X: pd.DataFrame, colname: str):
     return ser
 
 # =========================
-# ✅ 핵심: 학습을 "함수"로 감싸고 bundle을 반환
+# ✅ 핵심: 원본 학습 로직을 함수로 감싸고 bundle 반환 (pkl 저장 제거)
 # =========================
 def train_bundle(data_xlsx: str = DATA_XLSX, seed: int = RSEED):
     # ===== 데이터 로드 =====
@@ -249,7 +249,7 @@ def train_bundle(data_xlsx: str = DATA_XLSX, seed: int = RSEED):
     for k, v in metrics.items():
         print(f"{k:32s}  R²={v['R2']:7.4f}  MAE={v['MAE']:8.5f}  MAPE={v['MAPE']:6.2f}%")
 
-    # ===== 저장(meta)는 그대로 구성하되, pkl dump는 제거하고 반환 =====
+    # ===== meta 구성(원본 그대로) =====
     meta = {
         "input_cols": input_cols,
         "cat_inputs": cat_inputs,
@@ -257,9 +257,10 @@ def train_bundle(data_xlsx: str = DATA_XLSX, seed: int = RSEED):
         "num_medians": df[input_cols].apply(pd.to_numeric, errors="coerce").median(numeric_only=True).to_dict(),
         "feature_columns": list(X_all.columns)
     }
+
+    # ✅ pkl 저장 제거, 즉시 반환
     return {"model": pipe, "meta": meta, "metrics": metrics, "r2_flat": r2_flat}
 
-
-# (선택) 이 파일을 단독 실행할 때만 학습 돌리도록 유지
 if __name__ == "__main__":
+    # 단독 실행 시에도 pkl 저장 없이 학습만 수행
     train_bundle()
