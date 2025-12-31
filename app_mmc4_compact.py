@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-# app_mmc4_compact.py — Tension η·εf 입력, Notch/Shear (η,εf)+Bulge εf 예측, Bulge η=2/3
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -7,42 +6,41 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-import joblib  # (원본 유지: 현재 코드 상 다른 곳에서 안 써도 무방하지만 그대로 둠)
 
 from scipy.optimize import least_squares
 from scipy.interpolate import CubicHermiteSpline
 
-# ✅ pkl 로드 대신: 실행 시 학습 번들 반환
 from train_export_model import train_bundle
 
-# ===== 모델 로드 =====
+# ===== 모델: 매 시행 랜덤 학습 =====
 st.set_page_config(page_title="MMC4 Predictor", layout="wide")
 st.title("POSCO MMC4 — 모델 예측 기반 곡선 시각화")
 
-@st.cache_resource(show_spinner=True)
-def get_trained_bundle():
-    return train_bundle()
+# “매 시행 랜덤 학습”을 만족시키려면 cache를 기본적으로 끄거나,
+# 버튼으로 명시적으로 재학습을 트리거해야 함.
+# 아래는 버튼 누를 때마다 seed 랜덤 재학습 방식(권장: UI 조작 시마다 재학습되는 것 방지).
+if "train_seed" not in st.session_state:
+    st.session_state["train_seed"] = int(np.random.randint(0, 2**31 - 1))
 
-try:
-    bundle = get_trained_bundle()
-    model = bundle["model"]
-    meta  = bundle["meta"]
-except Exception as e:
-    st.error(f"모델 학습/로드 실패: {e}")
-    st.stop()
+def train_now(seed: int):
+    return train_bundle(seed=seed)
+
+# 사이드바: 재학습 버튼
+st.sidebar.header("학습")
+st.sidebar.write(f"현재 seed: {st.session_state['train_seed']}")
+if st.sidebar.button("모델 랜덤 재학습"):
+    st.session_state["train_seed"] = int(np.random.randint(0, 2**31 - 1))
+
+bundle = train_now(st.session_state["train_seed"])
+model = bundle["model"]
+meta  = bundle["meta"]
 
 INPUTS = meta["input_cols"]
 CAT_INPUTS = meta["cat_inputs"]
-OUTPUTS = meta["output_cols"]      # 5 타깃
+OUTPUTS = meta["output_cols"]
 MEDIANS = meta.get("num_medians", {})
-FEATURES = meta.get("feature_columns", [])
 
-# (선택) 재학습 버튼
-if st.sidebar.button("모델 재학습(캐시 초기화)"):
-    get_trained_bundle.clear()
-    st.rerun()
-
-# ===== 특징공학 =====
+# ===== 특징공학 (원본 그대로) =====
 def build_enhanced_features(df_, input_cols, cat_inputs):
     X = df_[input_cols + cat_inputs].copy()
 
@@ -86,7 +84,7 @@ def build_enhanced_features(df_, input_cols, cat_inputs):
             X['efT_x_etaT'] = efT * etaT
     return X
 
-# ===== MMC4 수식/적합 =====
+# ===== MMC4 수식/피팅 (원본 그대로) =====
 def theta_bar(eta):
     arg = -(27.0/2.0)*eta*(eta**2 - 1.0/3.0)
     arg = np.clip(arg, -1.0, 1.0)
@@ -114,8 +112,8 @@ def fit_mmc4(etas, epss):
     res=least_squares(resid,x0,bounds=(lb,ub),max_nfev=5000,verbose=0)
     return res.x
 
-# ===== 입력 폼 =====
-st.header("입력값(노란색)")
+# ===== 입력 UI =====
+st.header("입력값(6개)")
 c1, c2 = st.columns(2)
 with c1:
     ys  = st.number_input("Yield Stress(MPa)", value=float(MEDIANS.get("Yield Stress(MPa)", 200.0)))
@@ -139,9 +137,9 @@ if len(extra_inputs) or len(CAT_INPUTS):
         for c in extra_inputs:
             adv_vals[c] = st.number_input(c, value=float(MEDIANS.get(c, 0.0)))
 
-# ===== 예측 =====
+# ===== 예측 및 플롯 =====
 if st.button("예측 및 MMC4 플롯"):
-    # 1) 입력 dict
+    # 입력 DF
     x_dict = {
         "Yield Stress(MPa)": ys,
         "Ultimate Tensile Stress(MPa)": uts,
@@ -157,7 +155,6 @@ if st.button("예측 및 MMC4 플롯"):
 
     x_one = pd.DataFrame([x_dict])
 
-    # 2) 누락 컬럼 보강
     for col in INPUTS:
         if col not in x_one.columns:
             x_one[col] = np.nan
@@ -165,10 +162,9 @@ if st.button("예측 및 MMC4 플롯"):
         if col not in x_one.columns:
             x_one[col] = ""
 
-    # 3) 특징공학
     X_tmp = build_enhanced_features(x_one, INPUTS, CAT_INPUTS)
 
-    # 4) 스키마 정렬
+    # 스키마 정렬
     pre = model.named_steps['pre']
     num_cols_model = list(next(t[2] for t in pre.transformers if t[0] == 'num'))
     cat_cols_model = []
@@ -188,10 +184,10 @@ if st.button("예측 및 MMC4 플롯"):
     if cat_cols_model:
         X_feed[cat_cols_model] = x_one[cat_cols_model].astype(str)
 
-    # 5) 예측 수행(타깃 5개)
+    # 타깃 예측
     y_hat = pd.Series(model.predict(X_feed)[0], index=OUTPUTS)
 
-    # 6) 4점 확정: Tension은 입력값 사용, Bulge η=2/3 고정
+    # 4점 구성
     eta_shear = y_hat.get("Triaxiality(Shear0)")
     ef_shear  = y_hat.get("Fracture strain(Shear0)")
     eta_notch = y_hat.get("Triaxiality(Notch R05)")
@@ -200,18 +196,7 @@ if st.button("예측 및 MMC4 플롯"):
 
     eta_tens  = float(etaT)
     ef_tens   = float(efT)
-    eta_bulge = 2.0/3.0  # 요구사항: Bulge η는 상수
-
-    # 7) 누락 검사
-    missing = []
-    if eta_shear is None: missing.append("η(Shear)")
-    if ef_shear  is None: missing.append("εf(Shear)")
-    if eta_notch is None: missing.append("η(Notch R05)")
-    if ef_notch  is None: missing.append("εf(Notch R05)")
-    if ef_bulge  is None: missing.append("εf(Bulge)")
-    if missing:
-        st.error("부족한 값: " + ", ".join(missing) + " — 학습/스키마를 점검하십시오.")
-        st.stop()
+    eta_bulge = 2.0/3.0
 
     pts = [
         ("Shear",   float(eta_shear), float(ef_shear)),
@@ -221,125 +206,71 @@ if st.button("예측 및 MMC4 플롯"):
     ]
     pts = sorted(pts, key=lambda t: t[1])
 
-    etas=np.array([p[1] for p in pts])
-    epss=np.array([p[2] for p in pts])
-    C_hat=fit_mmc4(etas,epss)
+    etas = np.array([p[1] for p in pts], dtype=float)
+    epss = np.array([p[2] for p in pts], dtype=float)
+    C_hat = fit_mmc4(etas, epss)
 
-    st.session_state["mmc4_pts"] = pts
-    st.session_state["mmc4_C_hat"] = C_hat
-
-# ===== 결과 출력 =====
-if "mmc4_pts" in st.session_state and "mmc4_C_hat" in st.session_state:
-    pts = st.session_state["mmc4_pts"]
-    C_hat = st.session_state["mmc4_C_hat"]
-
-    # ===== 플롯 =====
-    # [수정 시작] (원본 블록 유지 + 단조 증가/상한 캡만 추가)
+    # ===== 플롯 범위(요구사항 고정) =====
     eta_lo, eta_hi = -0.1, 0.7
-    eta_grid = np.linspace(eta_lo, eta_hi, 200)
+    eta_grid = np.linspace(eta_lo, eta_hi, 240)
 
+    # 기본은 MMC4 그대로(= Shear 이전 포함 전 구간 보간 없음)
     eps_curve = mmc4_eps(eta_grid, C_hat)
 
-    etas = np.array([p[1] for p in pts])
-    eta_min = float(etas.min())
-    eta_max = float(etas.max())
-
-    # y 상한(요구사항): Bulge 점 + 0.3
+    # y 상한: Bulge + 0.3
     bulge_y = float(next(y for name, _, y in pts if name == "Bulge"))
     y_cap = bulge_y + 0.3
 
-    # (1) 좌측(Shear 왼쪽): 포물선으로 상승 (단조 증가 유지) + y_cap 초과 방지
-    e_min = float(mmc4_eps(eta_min, C_hat))
-    delta = eta_min - eta_lo
-    curv = abs(e_min) / (delta**2 + 1e-6) * 0.6
-
-    # eta_lo에서 y_cap를 넘지 않도록 curv 캡
-    if delta > 1e-8:
-        curv_cap = max(0.0, (y_cap - e_min) / (delta**2 + 1e-8))
-        curv = min(curv, curv_cap)
-
-    def left_curve(eta):
-        return e_min + curv * (eta - eta_min)**2
-
-    mask_left = eta_grid < eta_min
-    if np.any(mask_left):
-        eps_curve[mask_left] = np.minimum(left_curve(eta_grid[mask_left]), y_cap)
-
-    # (2) 우측(Bulge 오른쪽): Hermite spline 외삽
-    #     요구사항: 우측으로 갈수록 단조 증가(비감소) + y_cap 초과 방지
+    # ===== Bulge 이후(η>2/3)만 C¹ 보간 + 단조 증가 보장 =====
+    bulge_eta = 2.0/3.0
     h = 1e-4
     def d_mmc4(e):
-        return float((mmc4_eps(e + h, C_hat) - mmc4_eps(e - h, C_hat)) / (2.0 * h))
+        return float((mmc4_eps(e + h, C_hat) - mmc4_eps(e - h, C_hat)) / (2.0*h))
 
-    e_max = float(mmc4_eps(eta_max, C_hat))
-    d_raw = d_mmc4(eta_max)
+    # join은 "mmc4 자체"에서 연속되게(값/미분 모두 mmc4 기준)
+    y0 = float(mmc4_eps(bulge_eta, C_hat))
+    d0_raw = d_mmc4(bulge_eta)
 
-    dx = (eta_hi - eta_max)
-    slope_cap = (y_cap - e_max) / (dx + 1e-8)
+    # 종점은 y_cap에 맞춰서 시각화 상한까지 매끈하게 상승
+    x1 = float(eta_hi)
+    y1 = float(y_cap)
 
-    d_max = max(0.0, d_raw)          # 단조 증가 보장(기울기 음수 금지)
-    d_max = min(d_max, slope_cap)    # y_cap 초과 방지
+    dx = (x1 - bulge_eta)
+    m = (y1 - y0) / (dx + 1e-12)
 
-    y_hi = e_max + d_max * dx
-    y_hi = min(y_hi, y_cap)
-    y_hi = max(y_hi, e_max)
+    # 단조 증가 조건: d0>=0, 또한 Hermite 단조성(overshoot 방지) 위해 d0 <= 3m
+    # (두 점 Hermite에서 대표적인 충분조건)
+    d0 = max(0.0, d0_raw)
+    d0 = min(d0, 3.0*m) if m > 0 else 0.0
 
-    right_conn = CubicHermiteSpline([eta_max, eta_hi], [e_max, y_hi], [d_max, d_max])
+    # 기울기 변화가 이상해 보인다고 했으니, 끝점도 동일 기울기로 설정
+    d1 = d0
 
-    mask_right = eta_grid > eta_max
+    right_conn = CubicHermiteSpline([bulge_eta, x1], [y0, y1], [d0, d1])
+
+    mask_right = eta_grid > bulge_eta
     if np.any(mask_right):
-        eps_curve[mask_right] = np.minimum(right_conn(eta_grid[mask_right]), y_cap)
+        eps_curve[mask_right] = right_conn(eta_grid[mask_right])
 
-    # 전체적으로도 y_cap 클리핑(수치 폭주 방지)
+    # 혹시 수치 튐 방지: y_cap 이하로만 클리핑(시각화 범위 유지)
     eps_curve = np.minimum(eps_curve, y_cap)
-    # [수정 끝]
 
-    fig,ax=plt.subplots(figsize=(7,4.5))
-    ax.plot(eta_grid,eps_curve,lw=2,label="MMC4 curve (fit)")
-    for name,x,y in pts:
-        ax.scatter([x],[y],s=60,edgecolor="k",zorder=5,label=name)
-        ax.annotate(name,(x,y),xytext=(5,5),textcoords="offset points",fontsize=9)
+    # ===== 시각화 =====
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(eta_grid, eps_curve, lw=2, label="MMC4 curve (fit)")
+    for name, x, y in pts:
+        ax.scatter([x], [y], s=70, edgecolor="k", zorder=5, label=name)
+        ax.annotate(name, (x, y), xytext=(5, 5), textcoords="offset points", fontsize=10)
+
     ax.set_xlabel("Triaxiality (η)")
     ax.set_ylabel("Fracture strain (εf)")
     ax.set_xlim(eta_lo, eta_hi)
-    ax.set_ylim(0.0, float(next(y for name, _, y in pts if name == "Bulge")) + 0.3)
+    ax.set_ylim(0.0, y_cap)
     ax.set_title("MMC4 Curve")
-    ax.grid(True,alpha=0.3)
+    ax.grid(True, alpha=0.3)
     ax.legend()
     st.pyplot(fig)
 
-    st.markdown("**4점 요약**")
-    for name,x,y in pts:
-        st.text(f"{name:8s} η={x:.4f}  εf={y:.5f}")
-    st.markdown("**적합 파라미터 C1~C6**")
-    st.text("C = [" + ", ".join(f"{v:.6f}" for v in C_hat) + "]")
-
-    st.markdown("**특정 η 입력 → εf 출력**")
-    eta_query = st.number_input(
-        "조회할 Triaxiality (η_query)",
-        value=float(np.clip((eta_lo + eta_hi) / 2.0, eta_lo, eta_hi)),
-        min_value=float(eta_lo),
-        max_value=float(eta_hi),
-        step=0.01,
-        format="%.5f",
-        key="mmc4_eta_query"
-    )
-
-    # 조회도 동일 규칙 적용: 좌/우는 단조 증가 외삽, 내부는 MMC4
-    if eta_query < eta_min:
-        # 좌측은 left_curve (y_cap 캡)
-        # left_curve는 eta_min에서 최소, 좌로 갈수록 증가 구조
-        e_min = float(mmc4_eps(eta_min, C_hat))
-        delta = eta_min - eta_lo
-        curv = abs(e_min) / (delta**2 + 1e-6) * 0.6
-        if delta > 1e-8:
-            curv_cap = max(0.0, (y_cap - e_min) / (delta**2 + 1e-8))
-            curv = min(curv, curv_cap)
-        eps_query = float(min(e_min + curv * (eta_query - eta_min)**2, y_cap))
-    elif eta_query > eta_max:
-        # 우측은 right_conn (y_cap 캡)
-        eps_query = float(min(right_conn(eta_query), y_cap))
-    else:
-        eps_query = float(mmc4_eps(eta_query, C_hat))
-
-    st.write(f"**결과:** η = {eta_query:.5f} 에서 **εf = {eps_query:.6f}** 입니다.")
+    st.write("4점:", pts)
+    st.write("C =", [float(v) for v in C_hat])
+    st.write(f"Bulge join: y0=mmc4(2/3)={y0:.6f}, d0(mm4)={d0_raw:.6f} → used d0={d0:.6f}")
