@@ -5,11 +5,11 @@ app.py — 엑셀에서 바로 학습해서 MMC4 curve를 그려주는 Streamlit
 - mmc4_model.pkl / pickle 전혀 사용하지 않음
 - 앱 실행 시 엑셀에서 바로 학습하고, 그 모델로 MMC4 곡선 도식화
 
-요구사항 반영:
+반영 사항
 1) Shear 이전~Bulge 이전(η <= 2/3): 보간/외삽 없이 MMC4 그대로 플롯
 2) Bulge 이후(η > 2/3): 업로드 원본(app_mmc4_compact.py)의 우측 Hermite 외삽 로직 "그대로" 적용
-3) 특정 η(삼축응력값) 입력 → εf 출력 UI 추가 (스크린샷과 동일 형태)
-4) 모델은 random_state 고정하지 않음(매 재학습은 랜덤). 다만 Streamlit cache가 있으므로 버튼으로 재학습 트리거 제공
+3) 특정 η(삼축응력값) 입력 → εf 출력 UI 추가
+4) 특정 η 입력 시 초기화되는 문제 해결: 버튼 결과를 st.session_state에 저장하여 rerun에도 유지
 """
 
 import warnings
@@ -42,20 +42,14 @@ from scipy.interpolate import CubicHermiteSpline
 DATA_XLSX = "250811_산학프로젝트_포스코의 워크시트.xlsx"  # 같은 폴더에 두기
 SHEET_FALLBACK = "학습DB"
 
-# 타깃(5개): Notch 2 + Shear 2 + Bulge εf (Bulge η는 상수 2/3 사용)
 TARGETS_FIXED = [
     "Triaxiality(Notch R05)",     "Fracture strain(Notch R05)",
     "Triaxiality(Shear0)",        "Fracture strain(Shear0)",
     "Fracture strain(Punch Bulge)"
 ]
-
-# Tension η, εf 는 항상 "입력"으로 사용
 FORCE_INPUT = {"Triaxiality(Tension)", "Fracture strain(Tension)"}
 
-# Bulge η 상수
 ETA_BULGE = 2.0 / 3.0
-
-# 플롯 범위(요구사항)
 ETA_LO, ETA_HI = -0.1, 0.7
 
 st.set_page_config(page_title="MMC4 Predictor", layout="wide")
@@ -63,14 +57,16 @@ st.title("POSCO MMC4 — 모델 예측 기반 MMC4 곡선 시각화")
 
 
 # =========================
-# (중요) 랜덤 재학습 트리거
+# 세션 상태 초기화
+# =========================
+if "mmc4_ready" not in st.session_state:
+    st.session_state["mmc4_ready"] = False
+
+# =========================
+# Sidebar: 재학습 트리거
 # =========================
 st.sidebar.header("학습")
-st.sidebar.caption("random_state=None이더라도 Streamlit cache가 남아있으면 같은 모델이 유지될 수 있습니다.")
-
-# load_and_train()는 아래에 정의되므로, 버튼은 "placeholder"로만 두고,
-# 실제 clear는 아래에서 load_and_train 정의 후에 처리해도 되지만,
-# Streamlit은 스크립트를 위에서 아래로 실행하므로, 여기서는 버튼 상태만 저장해 둡니다.
+st.sidebar.caption("random_state=None이더라도 Streamlit cache가 있으면 같은 모델이 유지될 수 있습니다.")
 do_retrain = st.sidebar.button("모델 다시 학습(랜덤)")
 
 
@@ -118,9 +114,9 @@ def classify_rgb(rgb):
     g = int(rgb[2:4], 16)
     b = int(rgb[4:6], 16)
     if r >= 200 and g >= 200 and b <= 120:
-        return "yellow"      # 입력
+        return "yellow"
     if r <= 180 and g >= 170 and b >= 190:
-        return "skyblue"     # 출력
+        return "skyblue"
     return None
 
 
@@ -138,7 +134,6 @@ def infer_by_name(columns):
 
 
 def _as_series_single(X: pd.DataFrame, colname: str):
-    """중복 컬럼이 있어도 단일 Series로 축약(왼쪽→오른쪽 첫 유효값)."""
     if colname not in X.columns:
         return None
     cols = [c for c in X.columns if c == colname]
@@ -187,7 +182,6 @@ def build_enhanced_features(df_, input_cols, cat_inputs):
         if etaT is not None:
             X['efT_x_etaT'] = efT * etaT
 
-    # 추가 상호작용
     key = [('Total Elongation', tel),
            ('r-value', rv),
            ('Triaxiality(Tension)', etaT)]
@@ -197,6 +191,7 @@ def build_enhanced_features(df_, input_cols, cat_inputs):
             n2, s2 = key[j]
             if s1 is not None and s2 is not None:
                 X[f'{n1}_x_{n2}'] = s1 * s2
+
     return X
 
 
@@ -215,7 +210,6 @@ def load_and_train():
     df = read_excel_safe(DATA_XLSX)
     df = df.dropna(axis=1, how="all")
 
-    # 색상 기반으로 입력/출력 컬럼 추출
     headers, classes = [], []
     for col in range(1, ws.max_column + 1):
         cell = ws.cell(row=1, column=col)
@@ -230,18 +224,13 @@ def load_and_train():
             elif cls == "skyblue":
                 output_cols.append(name)
 
-    # 색상 정보가 거의 없으면 이름으로 추론
     if len(output_cols) == 0:
         inf_in, inf_out = infer_by_name(list(df.columns))
         output_cols = [c for c in inf_out if pd.api.types.is_numeric_dtype(df[c])]
-        input_cols = [
-            c for c in df.columns
-            if c not in output_cols and pd.api.types.is_numeric_dtype(df[c])
-        ]
+        input_cols = [c for c in df.columns if c not in output_cols and pd.api.types.is_numeric_dtype(df[c])]
 
     cat_inputs = ['Material'] if 'Material' in df.columns else []
 
-    # Tension η, εf 강제로 입력에 포함
     for c in list(df.columns):
         if c in FORCE_INPUT:
             if c in output_cols:
@@ -249,10 +238,8 @@ def load_and_train():
             if pd.api.types.is_numeric_dtype(df[c]) and c not in input_cols:
                 input_cols.append(c)
 
-    # 타깃은 고정 리스트 중 실제 존재하는 것만 사용 (Bulge η는 학습 안함)
     output_cols = [c for c in TARGETS_FIXED if c in df.columns]
 
-    # 숫자 변환
     for col in set(input_cols + output_cols):
         try:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -261,15 +248,11 @@ def load_and_train():
 
     needed = list(dict.fromkeys(input_cols + cat_inputs + output_cols))
     df_model = df[needed].copy()
-    df_model = df_model.dropna(
-        subset=[c for c in output_cols if c in df_model.columns],
-        how="any"
-    )
+    df_model = df_model.dropna(subset=[c for c in output_cols if c in df_model.columns], how="any")
 
     X_all = build_enhanced_features(df_model, input_cols, cat_inputs)
     y_all = df_model[[c for c in output_cols if c in df_model.columns]].copy()
 
-    # 파이프라인 구성
     num_cols = [c for c in X_all.columns if c not in cat_inputs]
     try:
         ohe = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
@@ -285,13 +268,12 @@ def load_and_train():
     )
 
     def create_et():
-        # ✅ 매 학습 랜덤 (고정하지 않음)
         return ExtraTreesRegressor(
             n_estimators=300,
             max_depth=None,
             max_features='sqrt',
             bootstrap=True,
-            random_state=None,
+            random_state=None,   # 고정하지 않음
             n_jobs=-1
         )
 
@@ -306,22 +288,25 @@ def load_and_train():
         "input_cols": input_cols,
         "cat_inputs": cat_inputs,
         "output_cols": list(y_all.columns),
-        "num_medians": df[input_cols].apply(
-            pd.to_numeric, errors="coerce"
-        ).median(numeric_only=True).to_dict(),
+        "num_medians": df[input_cols].apply(pd.to_numeric, errors="coerce").median(numeric_only=True).to_dict(),
         "feature_columns": list(X_all.columns)
     }
     return pipe, meta
 
 
-# 버튼이 눌렸으면 cache clear → rerun
+# 재학습 버튼 처리 (cache clear + 결과 초기화)
 if do_retrain:
     load_and_train.clear()
+    st.session_state["mmc4_ready"] = False
+    # 결과 저장값들도 제거
+    for k in ["pts", "C_hat", "ef_bulge", "e_max", "d_max"]:
+        if k in st.session_state:
+            del st.session_state[k]
     st.rerun()
 
 
 # =========================
-# 모델 로드/학습 호출
+# 모델 로드/학습
 # =========================
 try:
     model, meta = load_and_train()
@@ -340,37 +325,18 @@ MEDIANS = meta.get("num_medians", {})
 # =========================
 st.header("입력값(노란색)")
 c1, c2 = st.columns(2)
-with c1:
-    ys = st.number_input(
-        "Yield Stress(MPa)",
-        value=float(MEDIANS.get("Yield Stress(MPa)", 200.0))
-    )
-    uts = st.number_input(
-        "Ultimate Tensile Stress(MPa)",
-        value=float(MEDIANS.get("Ultimate Tensile Stress(MPa)", 350.0))
-    )
-    tel = st.number_input(
-        "Total Elongation",
-        value=float(MEDIANS.get("Total Elongation", 0.20)),
-        format="%.5f"
-    )
-with c2:
-    rv = st.number_input(
-        "r-value",
-        value=float(MEDIANS.get("r-value", 1.00)),
-        format="%.5f"
-    )
-    etaT = st.number_input(
-        "Triaxiality(Tension)",
-        value=float(MEDIANS.get("Triaxiality(Tension)", 0.33)),
-        min_value=-0.5, max_value=0.7, step=0.01, format="%.2f"
-    )
-    efT = st.number_input(
-        "Fracture strain(Tension)",
-        value=0.20, min_value=0.0, step=0.001, format="%.5f"
-    )
 
-# 추가 입력(있으면) + 범주형
+with c1:
+    ys = st.number_input("Yield Stress(MPa)", value=float(MEDIANS.get("Yield Stress(MPa)", 200.0)))
+    uts = st.number_input("Ultimate Tensile Stress(MPa)", value=float(MEDIANS.get("Ultimate Tensile Stress(MPa)", 350.0)))
+    tel = st.number_input("Total Elongation", value=float(MEDIANS.get("Total Elongation", 0.20)), format="%.5f")
+
+with c2:
+    rv = st.number_input("r-value", value=float(MEDIANS.get("r-value", 1.00)), format="%.5f")
+    etaT = st.number_input("Triaxiality(Tension)", value=float(MEDIANS.get("Triaxiality(Tension)", 0.33)),
+                           min_value=-0.5, max_value=0.7, step=0.01, format="%.2f")
+    efT = st.number_input("Fracture strain(Tension)", value=0.20, min_value=0.0, step=0.001, format="%.5f")
+
 extra_inputs = [
     c for c in INPUTS
     if c not in [
@@ -385,13 +351,11 @@ if len(extra_inputs) or len(CAT_INPUTS):
         for c in CAT_INPUTS:
             adv_vals[c] = st.text_input(c, value="")
         for c in extra_inputs:
-            adv_vals[c] = st.number_input(
-                c, value=float(MEDIANS.get(c, 0.0))
-            )
+            adv_vals[c] = st.number_input(c, value=float(MEDIANS.get(c, 0.0)))
 
 
 # =========================
-# MMC4 수식 관련 함수
+# MMC4 수식
 # =========================
 def theta_bar(eta):
     eta = np.asarray(eta, dtype=float)
@@ -403,11 +367,7 @@ def theta_bar(eta):
 def c6_effective(eta, C6):
     t = 1.0 / np.sqrt(3.0)
     eta = np.asarray(eta, dtype=float)
-    return np.where(
-        (eta <= -t) | ((eta >= 0) & (eta <= t)),
-        1.0,
-        float(C6)
-    )
+    return np.where((eta <= -t) | ((eta >= 0) & (eta <= t)), 1.0, float(C6))
 
 
 def mmc4_eps(eta, C):
@@ -440,15 +400,12 @@ def fit_mmc4(etas, epss):
     lb = np.array([0.001, 0.10, -2.0, 0.10, 0.0, 0.0])
     ub = np.array([10.0, 5.0,  2.0, 5.0,  2.0, 2.0])
 
-    res = least_squares(
-        resid, x0, bounds=(lb, ub),
-        max_nfev=5000, verbose=0
-    )
+    res = least_squares(resid, x0, bounds=(lb, ub), max_nfev=5000, verbose=0)
     return res.x
 
 
 # =========================
-# 예측 및 플롯
+# 예측 및 MMC4 플롯 계산 버튼
 # =========================
 if st.button("예측 및 MMC4 플롯"):
     # (1) 입력 한 줄 만들기
@@ -480,9 +437,8 @@ if st.button("예측 및 MMC4 플롯"):
 
     # (4) 파이프라인 입력 스키마 맞추기
     pre = model.named_steps['pre']
-    num_cols_model = list(
-        next(t[2] for t in pre.transformers if t[0] == 'num')
-    )
+    num_cols_model = list(next(t[2] for t in pre.transformers if t[0] == 'num'))
+
     cat_cols_model = []
     for name, trans, cols in pre.transformers:
         if name == 'cat' and cols is not None and cols != 'drop':
@@ -500,7 +456,7 @@ if st.button("예측 및 MMC4 플롯"):
     if cat_cols_model:
         X_feed[cat_cols_model] = x_one[cat_cols_model].astype(str)
 
-    # (5) 예측 (타깃 전체 5개)
+    # (5) 예측
     y_hat = pd.Series(model.predict(X_feed)[0], index=OUTPUTS)
 
     # (6) 4점 구성 — Tension은 입력값, Bulge η=2/3 상수
@@ -510,61 +466,74 @@ if st.button("예측 및 MMC4 플롯"):
     ef_notch  = y_hat.get("Fracture strain(Notch R05)")
     ef_bulge  = y_hat.get("Fracture strain(Punch Bulge)")
 
-    eta_tens  = float(etaT)
-    ef_tens   = float(efT)
-    eta_bulge = ETA_BULGE
-
     missing = []
     if eta_shear is None: missing.append("η(Shear)")
-    if ef_shear  is None: missing.append("εf(Shear)")
-    if eta_notch is None: missing.append("η(Notch R05)")
-    if ef_notch  is None: missing.append("εf(Notch R05)")
-    if ef_bulge  is None: missing.append("εf(Bulge)")
+    if ef_shear is None:  missing.append("εf(Shear)")
+    if eta_notch is None: missing.append("η(Notch)")
+    if ef_notch is None:  missing.append("εf(Notch)")
+    if ef_bulge is None:  missing.append("εf(Bulge)")
     if missing:
         st.error("부족한 값: " + ", ".join(missing) + " — 엑셀/학습 스키마를 확인하세요.")
         st.stop()
 
     pts = [
-        ("Shear",   float(eta_shear),  float(ef_shear)),
-        ("Tension", float(eta_tens),   float(ef_tens)),
-        ("Notch",   float(eta_notch),  float(ef_notch)),
-        ("Bulge",   float(eta_bulge),  float(ef_bulge)),
+        ("Shear",   float(eta_shear), float(ef_shear)),
+        ("Tension", float(etaT),      float(efT)),
+        ("Notch",   float(eta_notch), float(ef_notch)),
+        ("Bulge",   float(ETA_BULGE), float(ef_bulge)),
     ]
     pts = sorted(pts, key=lambda t: t[1])
 
-    etas = np.array([p[1] for p in pts])
-    epss = np.array([p[2] for p in pts])
+    etas = np.array([p[1] for p in pts], dtype=float)
+    epss = np.array([p[2] for p in pts], dtype=float)
     C_hat = fit_mmc4(etas, epss)
 
-    # (7) 플롯: Shear 이전~Bulge 이전은 MMC4 그대로, Bulge 이후는 원본 우측 Hermite 로직
-    eta_grid = np.linspace(ETA_LO, ETA_HI, 300)
-    eps_curve = mmc4_eps(eta_grid, C_hat)
-
-    # 업로드 원본(app_mmc4_compact.py) 우측 외삽 로직 "그대로"
+    # Bulge 기준 우측 Hermite 외삽 파라미터 저장(원본 로직 그대로)
     h = 1e-4
     def d_mmc4(e):
         return float((mmc4_eps(e + h, C_hat) - mmc4_eps(e - h, C_hat)) / (2.0 * h))
 
-    e_max = float(mmc4_eps(eta_bulge, C_hat))
-    d_max = d_mmc4(eta_bulge)
+    e_max = float(mmc4_eps(ETA_BULGE, C_hat))
+    d_max = d_mmc4(ETA_BULGE)
 
-    y_hi = e_max + d_max * (ETA_HI - eta_bulge)
-    right_conn = CubicHermiteSpline([eta_bulge, ETA_HI], [e_max, y_hi], [d_max, d_max])
+    # 세션에 저장 (rerun에도 유지)
+    st.session_state["mmc4_ready"] = True
+    st.session_state["pts"] = pts
+    st.session_state["C_hat"] = C_hat
+    st.session_state["ef_bulge"] = float(ef_bulge)
+    st.session_state["e_max"] = e_max
+    st.session_state["d_max"] = d_max
 
-    mask_right = eta_grid > eta_bulge
+
+# =========================
+# 결과 표시 (mmc4_ready일 때만)
+# =========================
+if st.session_state.get("mmc4_ready", False):
+    pts = st.session_state["pts"]
+    C_hat = st.session_state["C_hat"]
+    ef_bulge = st.session_state["ef_bulge"]
+    e_max = st.session_state["e_max"]
+    d_max = st.session_state["d_max"]
+
+    # 곡선 계산
+    eta_grid = np.linspace(ETA_LO, ETA_HI, 300)
+    eps_curve = mmc4_eps(eta_grid, C_hat)
+
+    # Bulge 이후만 Hermite로 덮어쓰기(원본 로직 그대로)
+    y_hi = e_max + d_max * (ETA_HI - ETA_BULGE)
+    right_conn = CubicHermiteSpline([ETA_BULGE, ETA_HI], [e_max, y_hi], [d_max, d_max])
+
+    mask_right = eta_grid > ETA_BULGE
     if np.any(mask_right):
         eps_curve[mask_right] = right_conn(eta_grid[mask_right])
 
-    # ===== 시각화 =====
+    # 플롯
     fig, ax = plt.subplots(figsize=(7, 4.5))
     ax.plot(eta_grid, eps_curve, lw=2, label="MMC4 curve (fit)")
 
     for name, x, y in pts:
         ax.scatter([x], [y], s=60, edgecolor="k", zorder=5, label=name)
-        ax.annotate(
-            name, (x, y),
-            xytext=(5, 5), textcoords="offset points", fontsize=9
-        )
+        ax.annotate(name, (x, y), xytext=(5, 5), textcoords="offset points", fontsize=9)
 
     ax.set_xlabel("Triaxiality (η)")
     ax.set_ylabel("Fracture strain (εf)")
@@ -575,7 +544,7 @@ if st.button("예측 및 MMC4 플롯"):
     ax.legend()
     st.pyplot(fig)
 
-    # ===== 텍스트 출력(스크린샷 형태) =====
+    # 4점/파라미터 출력
     st.markdown("**4점 요약**")
     for name, x, y in pts:
         st.text(f"{name:8s} η={x:.4f}  εf={y:.5f}")
@@ -583,24 +552,24 @@ if st.button("예측 및 MMC4 플롯"):
     st.markdown("**적합 파라미터 C1~C6**")
     st.text("C = [" + ", ".join(f"{v:.6f}" for v in C_hat) + "]")
 
-    # ===== 특정 η 입력 → εf 출력 (스크린샷과 동일 UI/문구) =====
+    # 특정 η 입력 → εf 출력 (여기서 값 바꿔도 초기화되지 않음)
     st.markdown("**특정 η 입력 → εf 출력**")
-
     eta_query = st.number_input(
         "조회할 Triaxiality (η_query)",
-        value=0.30000,
+        value=float(st.session_state.get("eta_query", 0.30000)),
         min_value=float(ETA_LO),
         max_value=float(ETA_HI),
         step=0.01,
-        format="%.5f"
+        format="%.5f",
+        key="eta_query",
     )
 
-    # 조회 규칙:
-    # - Bulge 이전(η <= 2/3): MMC4 그대로
-    # - Bulge 이후(η > 2/3): 원본 우측 Hermite 외삽 right_conn 사용
-    if eta_query <= eta_bulge:
+    if eta_query <= ETA_BULGE:
         eps_query = float(mmc4_eps(eta_query, C_hat))
     else:
         eps_query = float(right_conn(eta_query))
 
     st.write(f"결과: η = {eta_query:.5f} 에서 εf = {eps_query:.6f} 입니다.")
+
+else:
+    st.info("입력값을 설정한 뒤, '예측 및 MMC4 플롯' 버튼을 눌러 결과를 생성하세요.")
