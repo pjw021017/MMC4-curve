@@ -1,3 +1,5 @@
+st.sidebar.write("DEPLOY CHECK: 2025-12-31 v3")
+
 # -*- coding: utf-8 -*-
 """
 app.py — 엑셀에서 바로 학습해서 MMC4 curve를 그려주는 Streamlit 앱
