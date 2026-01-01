@@ -5,14 +5,11 @@ app.py — 엑셀에서 바로 학습해서 MMC4 curve를 그려주는 Streamlit
 - mmc4_model.pkl / pickle 전혀 사용하지 않음
 - 앱 실행 시 엑셀에서 바로 학습하고, 그 모델로 MMC4 곡선 도식화
 
-추가 요구사항 반영
-1) 원본 데이터(약 1000행) 전부에 대해 MMC4 Curve를 계산/플롯 (배경, 연하게)
-2) Mild/HSS/AHSS 별 색상: 주황/초록/파랑 (배경/대표곡선 동일)
-3) 배경 곡선에는 예측 점(4점) 표시하지 않음
-4) MMC4 Curve 공간에서 Mild/HSS/AHSS 대표 곡선을 “구분선”으로 표시(각 그룹 median 곡선)
-5) 1~4를 배경으로 연하게 삽입
-6) 기존처럼 사용자 6개 입력 → 해당 소재 curve 출력
-7) curve 위치 기반으로 Mild/HSS/AHSS 분류 결과 출력 (C 파라미터 출력과 η_query 출력 사이)
+반영 사항
+1) Shear 이전~Bulge 이전(η <= 2/3): 보간/외삽 없이 MMC4 그대로 플롯
+2) Bulge 이후(η > 2/3): 업로드 원본(app_mmc4_compact.py)의 우측 Hermite 외삽 로직 "그대로" 적용
+3) 특정 η(삼축응력값) 입력 → εf 출력 UI 추가
+4) 특정 η 입력 시 초기화되는 문제 해결: 버튼 결과를 st.session_state에 저장하여 rerun에도 유지
 """
 
 import warnings
@@ -55,28 +52,6 @@ FORCE_INPUT = {"Triaxiality(Tension)", "Fracture strain(Tension)"}
 ETA_BULGE = 2.0 / 3.0
 ETA_LO, ETA_HI = -0.1, 0.7
 
-# 색상(요구사항)
-CLR = {
-    "Mild":  "#FF7F0E",  # 주황
-    "HSS":   "#2CA02C",  # 초록
-    "AHSS":  "#1F77B4",  # 파랑
-    "USER":  "#111111",  # 사용자 곡선(검정 계열)
-}
-
-# 강종(A~J) → 구분(표 기반)
-GRADE_TO_FAMILY = {
-    "A": "Mild",
-    "B": "HSS",
-    "C": "HSS",
-    "D": "AHSS",
-    "E": "HSS",
-    "F": "AHSS",
-    "G": "AHSS",
-    "H": "AHSS",
-    "I": "AHSS",
-    "J": "AHSS",
-}
-
 st.set_page_config(page_title="MMC4 Predictor", layout="wide")
 st.title("POSCO MMC4 — 모델 예측 기반 MMC4 곡선 시각화")
 
@@ -90,12 +65,9 @@ if "mmc4_ready" not in st.session_state:
 # =========================
 # Sidebar: 재학습 트리거
 # =========================
-st.sidebar.header("학습/표시")
+st.sidebar.header("학습")
 st.sidebar.caption("random_state=None이더라도 Streamlit cache가 있으면 같은 모델이 유지될 수 있습니다.")
 do_retrain = st.sidebar.button("모델 다시 학습(랜덤)")
-show_background = st.sidebar.checkbox("배경(1000개 MMC4 Curve) 표시", value=True)
-bg_stride = st.sidebar.number_input("배경 곡선 간격(stride, 1=전부)", min_value=1, max_value=50, value=1, step=1)
-bg_alpha = st.sidebar.slider("배경 곡선 투명도", 0.01, 0.30, 0.08, 0.01)
 
 
 # =========================
@@ -173,20 +145,6 @@ def _as_series_single(X: pd.DataFrame, colname: str):
     return ser
 
 
-def grade_to_family_from_material(material_value) -> str:
-    """
-    Material 컬럼의 첫 글자를 A~J 강종으로 가정.
-    예: 'A...', 'B...', 'C...' 형태.
-    """
-    if material_value is None:
-        return "UNKNOWN"
-    s = str(material_value).strip()
-    if len(s) == 0:
-        return "UNKNOWN"
-    g = s[0].upper()
-    return GRADE_TO_FAMILY.get(g, "UNKNOWN")
-
-
 # =========================
 # 특징공학
 # =========================
@@ -238,93 +196,6 @@ def build_enhanced_features(df_, input_cols, cat_inputs):
 
 
 # =========================
-# MMC4 수식
-# =========================
-def theta_bar(eta):
-    eta = np.asarray(eta, dtype=float)
-    arg = -(27.0 / 2.0) * eta * (eta ** 2 - 1.0 / 3.0)
-    arg = np.clip(arg, -1.0, 1.0)
-    return 1.0 - (2.0 / np.pi) * np.arccos(arg)
-
-
-def c6_effective(eta, C6):
-    t = 1.0 / np.sqrt(3.0)
-    eta = np.asarray(eta, dtype=float)
-    return np.where((eta <= -t) | ((eta >= 0) & (eta <= t)), 1.0, float(C6))
-
-
-def mmc4_eps(eta, C):
-    C1, C2, C3, C4, C5, C6 = C
-    eta = np.asarray(eta, dtype=float)
-
-    tb = theta_bar(eta)
-    c6e = c6_effective(eta, C6)
-    k = np.sqrt(3.0) / (2.0 - np.sqrt(3.0))
-
-    term1 = (C1 / C4) * (
-        C5 + k * (c6e - C5) * (1.0 / np.cos(tb * np.pi / 6.0) - 1.0)
-    )
-
-    base = np.sqrt(1.0 + (C3 ** 2) / 3.0) * np.cos(tb * np.pi / 6.0) \
-           + C3 * (eta + (1.0 / 3.0) * np.sin(tb * np.pi / 6.0))
-
-    base = np.maximum(base, 1e-6)
-    return term1 * (base ** (-1.0 / C2))
-
-
-def fit_mmc4(etas, epss, x0=None):
-    """
-    4점(etas, epss)에 대해 C1~C6 최적화.
-    배경 1000곡선 속도를 위해 max_nfev는 과도하게 키우지 않음.
-    """
-    etas = np.asarray(etas, dtype=float)
-    epss = np.asarray(epss, dtype=float)
-
-    def resid(p):
-        return mmc4_eps(etas, p) - epss
-
-    if x0 is None:
-        x0 = np.array([1.0, 1.0, 0.2, 1.0, 0.6, 0.8])
-
-    lb = np.array([0.001, 0.10, -2.0, 0.10, 0.0, 0.0])
-    ub = np.array([10.0, 5.0,  2.0, 5.0,  2.0, 2.0])
-
-    res = least_squares(
-        resid, x0, bounds=(lb, ub),
-        max_nfev=1800,  # 배경 계산 고려
-        verbose=0
-    )
-    return res.x
-
-
-def build_curve_from_C(C_hat, eta_grid):
-    """
-    요구사항:
-    - η <= 2/3: MMC4 식 그대로
-    - η > 2/3: 원본(app_mmc4_compact.py) 우측 Hermite 외삽 그대로
-    """
-    eta_grid = np.asarray(eta_grid, dtype=float)
-    eps_curve = mmc4_eps(eta_grid, C_hat)
-
-    # Bulge 기준 우측 Hermite 외삽
-    h = 1e-4
-    def d_mmc4(e):
-        return float((mmc4_eps(e + h, C_hat) - mmc4_eps(e - h, C_hat)) / (2.0 * h))
-
-    e_max = float(mmc4_eps(ETA_BULGE, C_hat))
-    d_max = d_mmc4(ETA_BULGE)
-
-    y_hi = e_max + d_max * (float(eta_grid.max()) - ETA_BULGE)
-    right_conn = CubicHermiteSpline([ETA_BULGE, float(eta_grid.max())], [e_max, y_hi], [d_max, d_max])
-
-    mask_right = eta_grid > ETA_BULGE
-    if np.any(mask_right):
-        eps_curve[mask_right] = right_conn(eta_grid[mask_right])
-
-    return eps_curve
-
-
-# =========================
 # 모델 학습 (엑셀 → 파이프라인)
 # =========================
 @st.cache_resource
@@ -354,7 +225,7 @@ def load_and_train():
                 output_cols.append(name)
 
     if len(output_cols) == 0:
-        _, inf_out = infer_by_name(list(df.columns))
+        inf_in, inf_out = infer_by_name(list(df.columns))
         output_cols = [c for c in inf_out if pd.api.types.is_numeric_dtype(df[c])]
         input_cols = [c for c in df.columns if c not in output_cols and pd.api.types.is_numeric_dtype(df[c])]
 
@@ -418,8 +289,7 @@ def load_and_train():
         "cat_inputs": cat_inputs,
         "output_cols": list(y_all.columns),
         "num_medians": df[input_cols].apply(pd.to_numeric, errors="coerce").median(numeric_only=True).to_dict(),
-        "feature_columns": list(X_all.columns),
-        "has_material": ("Material" in df.columns),
+        "feature_columns": list(X_all.columns)
     }
     return pipe, meta
 
@@ -428,7 +298,8 @@ def load_and_train():
 if do_retrain:
     load_and_train.clear()
     st.session_state["mmc4_ready"] = False
-    for k in ["pts", "C_hat", "ef_bulge", "e_max", "d_max", "user_curve", "family_pred", "family_scores"]:
+    # 결과 저장값들도 제거
+    for k in ["pts", "C_hat", "ef_bulge", "e_max", "d_max"]:
         if k in st.session_state:
             del st.session_state[k]
     st.rerun()
@@ -450,168 +321,7 @@ MEDIANS = meta.get("num_medians", {})
 
 
 # =========================
-# 배경용 데이터 로드
-# =========================
-@st.cache_data(show_spinner=False)
-def load_dataset_for_background():
-    df = read_excel_safe(DATA_XLSX)
-    df = df.dropna(axis=1, how="all").copy()
-
-    # 숫자 변환(가능한 컬럼만)
-    for c in df.columns:
-        if c == "Material":
-            continue
-        try:
-            df[c] = pd.to_numeric(df[c], errors="ignore")
-        except Exception:
-            pass
-
-    # 최소 필요: 6 입력 + Material(있으면) + tension 2개
-    must = [
-        "Yield Stress(MPa)",
-        "Ultimate Tensile Stress(MPa)",
-        "Total Elongation",
-        "r-value",
-        "Triaxiality(Tension)",
-        "Fracture strain(Tension)",
-    ]
-    missing = [c for c in must if c not in df.columns]
-    if missing:
-        raise ValueError(f"배경 곡선 계산에 필요한 컬럼이 엑셀에 없습니다: {missing}")
-
-    # 배경은 “행 단위”로 동작: tension η, εf가 NaN이면 불가
-    df = df.dropna(subset=must, how="any").reset_index(drop=True)
-
-    # 강종 패밀리
-    if "Material" in df.columns:
-        df["_FAMILY_"] = df["Material"].apply(grade_to_family_from_material)
-    else:
-        df["_FAMILY_"] = "UNKNOWN"
-
-    return df
-
-
-@st.cache_data(show_spinner=False)
-def compute_background_curves(stride: int = 1):
-    """
-    원본 데이터셋 전체(또는 stride 간격) 곡선을 계산하여 저장.
-    - 계산량이 커서 cache_data로 묶음.
-    """
-    df = load_dataset_for_background()
-    eta_grid = np.linspace(ETA_LO, ETA_HI, 250)
-
-    curves = {
-        "Mild": [],
-        "HSS": [],
-        "AHSS": [],
-    }
-
-    # preprocessor 스키마 준비
-    pre = model.named_steps["pre"]
-    num_cols_model = list(next(t[2] for t in pre.transformers if t[0] == "num"))
-    cat_cols_model = []
-    for name, trans, cols in pre.transformers:
-        if name == "cat" and cols is not None and cols != "drop":
-            cat_cols_model = list(cols)
-
-    last_x0 = None
-    n = len(df)
-    idxs = list(range(0, n, int(stride)))
-
-    for i in idxs:
-        row = df.iloc[i]
-
-        family = row["_FAMILY_"]
-        if family not in curves:
-            continue
-
-        # 입력 6개 + (Material 있으면 포함)
-        x_dict = {
-            "Yield Stress(MPa)": row["Yield Stress(MPa)"],
-            "Ultimate Tensile Stress(MPa)": row["Ultimate Tensile Stress(MPa)"],
-            "Total Elongation": row["Total Elongation"],
-            "r-value": row["r-value"],
-            "Triaxiality(Tension)": row["Triaxiality(Tension)"],
-            "Fracture strain(Tension)": row["Fracture strain(Tension)"],
-        }
-        if "Material" in df.columns:
-            x_dict["Material"] = row["Material"]
-
-        x_one = pd.DataFrame([x_dict])
-
-        # 누락 입력 보완(모델 input_cols 기준)
-        for col in INPUTS:
-            if col not in x_one.columns:
-                x_one[col] = np.nan
-        for col in CAT_INPUTS:
-            if col not in x_one.columns:
-                x_one[col] = ""
-
-        # 특징공학
-        X_tmp = build_enhanced_features(x_one, INPUTS, CAT_INPUTS)
-
-        for c in num_cols_model:
-            if c not in X_tmp.columns:
-                X_tmp[c] = np.nan
-        for c in cat_cols_model:
-            if c not in x_one.columns:
-                x_one[c] = ""
-
-        X_feed = pd.DataFrame()
-        X_feed[num_cols_model] = X_tmp[num_cols_model]
-        if cat_cols_model:
-            X_feed[cat_cols_model] = x_one[cat_cols_model].astype(str)
-
-        # 예측
-        try:
-            y_hat = pd.Series(model.predict(X_feed)[0], index=OUTPUTS)
-        except Exception:
-            continue
-
-        eta_shear = y_hat.get("Triaxiality(Shear0)")
-        ef_shear  = y_hat.get("Fracture strain(Shear0)")
-        eta_notch = y_hat.get("Triaxiality(Notch R05)")
-        ef_notch  = y_hat.get("Fracture strain(Notch R05)")
-        ef_bulge  = y_hat.get("Fracture strain(Punch Bulge)")
-        if any(v is None or (isinstance(v, float) and np.isnan(v)) for v in [eta_shear, ef_shear, eta_notch, ef_notch, ef_bulge]):
-            continue
-
-        eta_tens = float(row["Triaxiality(Tension)"])
-        ef_tens  = float(row["Fracture strain(Tension)"])
-
-        pts = [
-            (float(eta_shear), float(ef_shear)),
-            (float(eta_tens),  float(ef_tens)),
-            (float(eta_notch), float(ef_notch)),
-            (float(ETA_BULGE), float(ef_bulge)),
-        ]
-        pts = sorted(pts, key=lambda t: t[0])
-        etas = np.array([p[0] for p in pts], dtype=float)
-        epss = np.array([p[1] for p in pts], dtype=float)
-
-        try:
-            C_hat = fit_mmc4(etas, epss, x0=last_x0)
-            last_x0 = C_hat.copy()
-            curve = build_curve_from_C(C_hat, eta_grid)
-        except Exception:
-            continue
-
-        curves[family].append(curve.astype(float))
-
-    # 그룹 대표곡선(median)
-    med = {}
-    for fam, arr in curves.items():
-        if len(arr) == 0:
-            med[fam] = None
-        else:
-            M = np.vstack(arr)
-            med[fam] = np.median(M, axis=0)
-
-    return eta_grid, curves, med
-
-
-# =========================
-# 입력 폼 (사용자 6개)
+# 입력 폼
 # =========================
 st.header("입력값(노란색)")
 c1, c2 = st.columns(2)
@@ -645,7 +355,57 @@ if len(extra_inputs) or len(CAT_INPUTS):
 
 
 # =========================
-# 버튼: 사용자 예측 + 곡선 생성
+# MMC4 수식
+# =========================
+def theta_bar(eta):
+    eta = np.asarray(eta, dtype=float)
+    arg = -(27.0 / 2.0) * eta * (eta ** 2 - 1.0 / 3.0)
+    arg = np.clip(arg, -1.0, 1.0)
+    return 1.0 - (2.0 / np.pi) * np.arccos(arg)
+
+
+def c6_effective(eta, C6):
+    t = 1.0 / np.sqrt(3.0)
+    eta = np.asarray(eta, dtype=float)
+    return np.where((eta <= -t) | ((eta >= 0) & (eta <= t)), 1.0, float(C6))
+
+
+def mmc4_eps(eta, C):
+    C1, C2, C3, C4, C5, C6 = C
+    eta = np.asarray(eta, dtype=float)
+
+    tb = theta_bar(eta)
+    c6e = c6_effective(eta, C6)
+    k = np.sqrt(3.0) / (2.0 - np.sqrt(3.0))
+
+    term1 = (C1 / C4) * (
+        C5 + k * (c6e - C5) * (1.0 / np.cos(tb * np.pi / 6.0) - 1.0)
+    )
+
+    base = np.sqrt(1.0 + (C3 ** 2) / 3.0) * np.cos(tb * np.pi / 6.0) \
+           + C3 * (eta + (1.0 / 3.0) * np.sin(tb * np.pi / 6.0))
+
+    base = np.maximum(base, 1e-6)
+    return term1 * (base ** (-1.0 / C2))
+
+
+def fit_mmc4(etas, epss):
+    etas = np.asarray(etas, dtype=float)
+    epss = np.asarray(epss, dtype=float)
+
+    def resid(p):
+        return mmc4_eps(etas, p) - epss
+
+    x0 = np.array([1.0, 1.0, 0.2, 1.0, 0.6, 0.8])
+    lb = np.array([0.001, 0.10, -2.0, 0.10, 0.0, 0.0])
+    ub = np.array([10.0, 5.0,  2.0, 5.0,  2.0, 2.0])
+
+    res = least_squares(resid, x0, bounds=(lb, ub), max_nfev=5000, verbose=0)
+    return res.x
+
+
+# =========================
+# 예측 및 MMC4 플롯 계산 버튼
 # =========================
 if st.button("예측 및 MMC4 플롯"):
     # (1) 입력 한 줄 만들기
@@ -728,125 +488,72 @@ if st.button("예측 및 MMC4 플롯"):
     epss = np.array([p[2] for p in pts], dtype=float)
     C_hat = fit_mmc4(etas, epss)
 
-    # 사용자 곡선(그리드 고정)
-    eta_grid_user = np.linspace(ETA_LO, ETA_HI, 250)
-    user_curve = build_curve_from_C(C_hat, eta_grid_user)
+    # Bulge 기준 우측 Hermite 외삽 파라미터 저장(원본 로직 그대로)
+    h = 1e-4
+    def d_mmc4(e):
+        return float((mmc4_eps(e + h, C_hat) - mmc4_eps(e - h, C_hat)) / (2.0 * h))
 
-    # 세션 저장
+    e_max = float(mmc4_eps(ETA_BULGE, C_hat))
+    d_max = d_mmc4(ETA_BULGE)
+
+    # 세션에 저장 (rerun에도 유지)
     st.session_state["mmc4_ready"] = True
     st.session_state["pts"] = pts
     st.session_state["C_hat"] = C_hat
     st.session_state["ef_bulge"] = float(ef_bulge)
-    st.session_state["eta_grid_user"] = eta_grid_user
-    st.session_state["user_curve"] = user_curve
+    st.session_state["e_max"] = e_max
+    st.session_state["d_max"] = d_max
 
 
 # =========================
-# 결과 표시
+# 결과 표시 (mmc4_ready일 때만)
 # =========================
 if st.session_state.get("mmc4_ready", False):
     pts = st.session_state["pts"]
     C_hat = st.session_state["C_hat"]
     ef_bulge = st.session_state["ef_bulge"]
-    eta_grid_user = st.session_state["eta_grid_user"]
-    user_curve = st.session_state["user_curve"]
+    e_max = st.session_state["e_max"]
+    d_max = st.session_state["d_max"]
 
-    # ---- 배경 곡선 계산(캐시) ----
-    bg_eta_grid, bg_curves, bg_median = None, None, None
-    if show_background:
-        with st.spinner("배경(전체 데이터) MMC4 Curve 계산/로드 중... (최초 1회만 느릴 수 있음)"):
-            bg_eta_grid, bg_curves, bg_median = compute_background_curves(stride=int(bg_stride))
+    # 곡선 계산
+    eta_grid = np.linspace(ETA_LO, ETA_HI, 300)
+    eps_curve = mmc4_eps(eta_grid, C_hat)
 
-    # ---- 사용자 강종 분류(대표곡선과의 거리) ----
-    family_pred = None
-    family_scores = {}
-    if show_background and (bg_median is not None):
-        # 사용자 곡선과 배경 대표곡선의 그리드가 같도록 보정(필요 시 선형 보간)
-        # (현재 둘 다 250 포인트, 범위 동일이므로 대부분 동일하지만 안전 장치)
-        if bg_eta_grid is not None and not np.allclose(bg_eta_grid, eta_grid_user):
-            uc = np.interp(bg_eta_grid, eta_grid_user, user_curve)
-        else:
-            uc = user_curve.copy()
+    # Bulge 이후만 Hermite로 덮어쓰기(원본 로직 그대로)
+    y_hi = e_max + d_max * (ETA_HI - ETA_BULGE)
+    right_conn = CubicHermiteSpline([ETA_BULGE, ETA_HI], [e_max, y_hi], [d_max, d_max])
 
-        for fam in ["Mild", "HSS", "AHSS"]:
-            ref = bg_median.get(fam, None) if bg_median else None
-            if ref is None:
-                continue
-            rmse = float(np.sqrt(np.mean((uc - ref) ** 2)))
-            family_scores[fam] = rmse
+    mask_right = eta_grid > ETA_BULGE
+    if np.any(mask_right):
+        eps_curve[mask_right] = right_conn(eta_grid[mask_right])
 
-        if len(family_scores) > 0:
-            family_pred = min(family_scores.items(), key=lambda kv: kv[1])[0]
+    # 플롯
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(eta_grid, eps_curve, lw=2, label="MMC4 curve (fit)")
 
-        st.session_state["family_pred"] = family_pred
-        st.session_state["family_scores"] = family_scores
-
-    # ---- 플롯(배경 + 구분선 + 사용자곡선) ----
-    fig, ax = plt.subplots(figsize=(8.6, 5.2))
-
-    # 1) 배경(연하게)
-    if show_background and bg_curves is not None:
-        for fam in ["Mild", "HSS", "AHSS"]:
-            arr = bg_curves.get(fam, [])
-            if len(arr) == 0:
-                continue
-            for curve in arr:
-                ax.plot(bg_eta_grid, curve, color=CLR[fam], alpha=float(bg_alpha), lw=1)
-
-    # 2) 구분선(대표 median curve)
-    if show_background and bg_median is not None:
-        for fam in ["Mild", "HSS", "AHSS"]:
-            med = bg_median.get(fam, None)
-            if med is None:
-                continue
-            ax.plot(
-                bg_eta_grid, med,
-                color=CLR[fam], lw=2.6, alpha=1.0,
-                label=f"{fam} 대표 곡선(중앙값)"
-            )
-
-    # 3) 사용자 곡선(진하게)
-    ax.plot(eta_grid_user, user_curve, color=CLR["USER"], lw=2.8, label="사용자 MMC4 Curve")
-
-    # (요구사항) 배경에는 예측 점 안 찍음. 사용자 점도 기본은 안 찍음.
-    # 필요하면 아래 주석 해제:
-    # for name, x, y in pts:
-    #     ax.scatter([x], [y], s=50, edgecolor="k", zorder=5)
+    for name, x, y in pts:
+        ax.scatter([x], [y], s=60, edgecolor="k", zorder=5, label=name)
+        ax.annotate(name, (x, y), xytext=(5, 5), textcoords="offset points", fontsize=9)
 
     ax.set_xlabel("Triaxiality (η)")
     ax.set_ylabel("Fracture strain (εf)")
-    ax.set_title("MMC4 Curve (Background: Full Dataset / Grouped by Mild-HSS-AHSS)")
+    ax.set_title("MMC4 Curve")
     ax.set_xlim(ETA_LO, ETA_HI)
     ax.set_ylim(0.0, float(ef_bulge) + 0.3)
-    ax.grid(True, alpha=0.25)
-    ax.legend(loc="lower left")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
     st.pyplot(fig)
 
-    # ---- 4점/파라미터 출력 ----
-    st.markdown("**4점 요약(사용자)**")
+    # 4점/파라미터 출력
+    st.markdown("**4점 요약**")
     for name, x, y in pts:
         st.text(f"{name:8s} η={x:.4f}  εf={y:.5f}")
 
-    st.markdown("**적합 파라미터 C1~C6(사용자)**")
+    st.markdown("**적합 파라미터 C1~C6**")
     st.text("C = [" + ", ".join(f"{v:.6f}" for v in C_hat) + "]")
 
-    # ---- (추가) 강종 계열 분류 결과 ----
-    st.markdown("**강종 계열 분류(곡선 위치 기반)**")
-    if not show_background:
-        st.write("배경 곡선 표시가 꺼져 있어 분류를 수행하지 않았습니다. (사이드바에서 배경 표시를 켜세요.)")
-    else:
-        family_pred = st.session_state.get("family_pred", None)
-        scores = st.session_state.get("family_scores", {})
-        if family_pred is None or len(scores) == 0:
-            st.write("분류에 필요한 대표 곡선이 충분하지 않아 분류를 수행할 수 없습니다.")
-        else:
-            st.write(f"결론: 해당 강종은 **{family_pred}** 강으로 분류됩니다.")
-            # 점수(낮을수록 가까움)
-            st.caption("각 그룹 대표 곡선과의 거리(RMSE, 낮을수록 유사)")
-            st.write({k: float(f"{v:.6f}") for k, v in scores.items()})
-
-    # ---- 특정 η 입력 → εf 출력 ----
-    st.markdown("**특정 η 입력 → εf 출력(사용자 곡선)**")
+    # 특정 η 입력 → εf 출력 (여기서 값 바꿔도 초기화되지 않음)
+    st.markdown("**특정 η 입력 → εf 출력**")
     eta_query = st.number_input(
         "조회할 Triaxiality (η_query)",
         value=float(st.session_state.get("eta_query", 0.30000)),
@@ -857,9 +564,11 @@ if st.session_state.get("mmc4_ready", False):
         key="eta_query",
     )
 
-    # 사용자 곡선에서 보간(구간별 로직을 그대로 쓰려면 C로 직접 계산해도 되지만,
-    # 이미 user_curve가 해당 로직을 반영한 값이므로 여기서는 안전하게 보간)
-    eps_query = float(np.interp(eta_query, eta_grid_user, user_curve))
+    if eta_query <= ETA_BULGE:
+        eps_query = float(mmc4_eps(eta_query, C_hat))
+    else:
+        eps_query = float(right_conn(eta_query))
+
     st.write(f"결과: η = {eta_query:.5f} 에서 εf = {eps_query:.6f} 입니다.")
 
 else:
