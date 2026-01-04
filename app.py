@@ -7,9 +7,10 @@ app.py — 엑셀에서 바로 학습해서 MMC4 curve를 그려주는 Streamlit
 
 반영 사항
 1) Shear 이전~Bulge 이전(η <= 2/3): 보간/외삽 없이 MMC4 그대로 플롯
-2) Bulge 이후(η > 2/3): 업로드 원본(app_mmc4_compact.py)의 우측 Hermite 외삽 로직 "그대로" 적용
+2) Bulge 이후(η > 2/3): 우측 Hermite 외삽 로직 적용
 3) 특정 η(삼축응력값) 입력 → εf 출력 UI 추가
 4) 특정 η 입력 시 초기화되는 문제 해결: 버튼 결과를 st.session_state에 저장하여 rerun에도 유지
+5) YS/UTS 기반 강종 분류(Mild / HSS / AHSS) 및 MMC4 곡선 색상/설명 추가
 """
 
 import warnings
@@ -42,18 +43,47 @@ from scipy.interpolate import CubicHermiteSpline
 DATA_XLSX = "250811_산학프로젝트_포스코의 워크시트.xlsx"  # 같은 폴더에 두기
 SHEET_FALLBACK = "학습DB"
 
+# 타깃(5개): Notch 2 + Shear 2 + Bulge εf
 TARGETS_FIXED = [
     "Triaxiality(Notch R05)",     "Fracture strain(Notch R05)",
     "Triaxiality(Shear0)",        "Fracture strain(Shear0)",
-    "Fracture strain(Punch Bulge)"
+    "Fracture strain(Punch Bulge)",
 ]
+# Tension η, εf 는 항상 "입력"으로 사용
 FORCE_INPUT = {"Triaxiality(Tension)", "Fracture strain(Tension)"}
 
 ETA_BULGE = 2.0 / 3.0
 ETA_LO, ETA_HI = -0.1, 0.7
 
+# 강종 분류 색상
+STEEL_COLORS = {
+    "Mild": "#FFC107",   # yellow/gold
+    "HSS":  "#7CB342",   # green
+    "AHSS": "#039BE5",   # blue
+}
+
 st.set_page_config(page_title="MMC4 Predictor", layout="wide")
 st.title("POSCO MMC4 — 모델 예측 기반 MMC4 곡선 시각화")
+
+
+# =========================
+# 강종 분류 (YS 또는 UTS 기준)
+# =========================
+# - AHSS: YS >= 550 OR UTS >= 1000
+# - Mild: (AHSS가 아닌 경우) YS < 210 OR UTS < 400
+# - HSS : 그 외
+def classify_steel_by_strength(ys_mpa: float, uts_mpa: float) -> str:
+    try:
+        ys_mpa = float(ys_mpa)
+        uts_mpa = float(uts_mpa)
+    except Exception:
+        return "Unknown"
+
+    if (ys_mpa >= 550.0) or (uts_mpa >= 1000.0):
+        return "AHSS"
+    if (ys_mpa < 210.0) or (uts_mpa < 400.0):
+        return "Mild"
+    return "HSS"
 
 
 # =========================
@@ -66,7 +96,7 @@ if "mmc4_ready" not in st.session_state:
 # Sidebar: 재학습 트리거
 # =========================
 st.sidebar.header("학습")
-st.sidebar.caption("random_state=None이더라도 Streamlit cache가 있으면 같은 모델이 유지될 수 있습니다.")
+st.sidebar.caption("random_state=None이라도 Streamlit cache가 유지되면 같은 모델이 재사용될 수 있습니다.")
 do_retrain = st.sidebar.button("모델 다시 학습(랜덤)")
 
 
@@ -298,8 +328,7 @@ def load_and_train():
 if do_retrain:
     load_and_train.clear()
     st.session_state["mmc4_ready"] = False
-    # 결과 저장값들도 제거
-    for k in ["pts", "C_hat", "ef_bulge", "e_max", "d_max"]:
+    for k in ["pts", "C_hat", "ef_bulge", "e_max", "d_max", "steel_class"]:
         if k in st.session_state:
             del st.session_state[k]
     st.rerun()
@@ -333,9 +362,15 @@ with c1:
 
 with c2:
     rv = st.number_input("r-value", value=float(MEDIANS.get("r-value", 1.00)), format="%.5f")
-    etaT = st.number_input("Triaxiality(Tension)", value=float(MEDIANS.get("Triaxiality(Tension)", 0.33)),
-                           min_value=-0.5, max_value=0.7, step=0.01, format="%.2f")
-    efT = st.number_input("Fracture strain(Tension)", value=0.20, min_value=0.0, step=0.001, format="%.5f")
+    etaT = st.number_input(
+        "Triaxiality(Tension)",
+        value=float(MEDIANS.get("Triaxiality(Tension)", 0.33)),
+        min_value=-0.5, max_value=0.7, step=0.01, format="%.2f"
+    )
+    efT = st.number_input(
+        "Fracture strain(Tension)",
+        value=0.20, min_value=0.0, step=0.001, format="%.5f"
+    )
 
 extra_inputs = [
     c for c in INPUTS
@@ -468,10 +503,10 @@ if st.button("예측 및 MMC4 플롯"):
 
     missing = []
     if eta_shear is None: missing.append("η(Shear)")
-    if ef_shear is None:  missing.append("εf(Shear)")
+    if ef_shear  is None: missing.append("εf(Shear)")
     if eta_notch is None: missing.append("η(Notch)")
-    if ef_notch is None:  missing.append("εf(Notch)")
-    if ef_bulge is None:  missing.append("εf(Bulge)")
+    if ef_notch  is None: missing.append("εf(Notch)")
+    if ef_bulge  is None: missing.append("εf(Bulge)")
     if missing:
         st.error("부족한 값: " + ", ".join(missing) + " — 엑셀/학습 스키마를 확인하세요.")
         st.stop()
@@ -488,7 +523,7 @@ if st.button("예측 및 MMC4 플롯"):
     epss = np.array([p[2] for p in pts], dtype=float)
     C_hat = fit_mmc4(etas, epss)
 
-    # Bulge 기준 우측 Hermite 외삽 파라미터 저장(원본 로직 그대로)
+    # Bulge 기준 우측 Hermite 외삽 파라미터
     h = 1e-4
     def d_mmc4(e):
         return float((mmc4_eps(e + h, C_hat) - mmc4_eps(e - h, C_hat)) / (2.0 * h))
@@ -496,30 +531,35 @@ if st.button("예측 및 MMC4 플롯"):
     e_max = float(mmc4_eps(ETA_BULGE, C_hat))
     d_max = d_mmc4(ETA_BULGE)
 
+    # 강종 분류 (YS/UTS 기준)
+    steel_class = classify_steel_by_strength(ys, uts)
+
     # 세션에 저장 (rerun에도 유지)
-    st.session_state["mmc4_ready"] = True
-    st.session_state["pts"] = pts
-    st.session_state["C_hat"] = C_hat
-    st.session_state["ef_bulge"] = float(ef_bulge)
-    st.session_state["e_max"] = e_max
-    st.session_state["d_max"] = d_max
+    st.session_state["mmc4_ready"]  = True
+    st.session_state["pts"]         = pts
+    st.session_state["C_hat"]       = C_hat
+    st.session_state["ef_bulge"]    = float(ef_bulge)
+    st.session_state["e_max"]       = e_max
+    st.session_state["d_max"]       = d_max
+    st.session_state["steel_class"] = steel_class
 
 
 # =========================
 # 결과 표시 (mmc4_ready일 때만)
 # =========================
 if st.session_state.get("mmc4_ready", False):
-    pts = st.session_state["pts"]
-    C_hat = st.session_state["C_hat"]
-    ef_bulge = st.session_state["ef_bulge"]
-    e_max = st.session_state["e_max"]
-    d_max = st.session_state["d_max"]
+    pts        = st.session_state["pts"]
+    C_hat      = st.session_state["C_hat"]
+    ef_bulge   = st.session_state["ef_bulge"]
+    e_max      = st.session_state["e_max"]
+    d_max      = st.session_state["d_max"]
+    steel_class= st.session_state.get("steel_class", "Unknown")
 
-    # 곡선 계산
+    # MMC4 곡선 계산
     eta_grid = np.linspace(ETA_LO, ETA_HI, 300)
     eps_curve = mmc4_eps(eta_grid, C_hat)
 
-    # Bulge 이후만 Hermite로 덮어쓰기(원본 로직 그대로)
+    # Bulge 이후만 Hermite로 덮어쓰기
     y_hi = e_max + d_max * (ETA_HI - ETA_BULGE)
     right_conn = CubicHermiteSpline([ETA_BULGE, ETA_HI], [e_max, y_hi], [d_max, d_max])
 
@@ -527,9 +567,13 @@ if st.session_state.get("mmc4_ready", False):
     if np.any(mask_right):
         eps_curve[mask_right] = right_conn(eta_grid[mask_right])
 
+    # 강종별 색상 선택
+    curve_color = STEEL_COLORS.get(steel_class, "C0")
+
     # 플롯
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(eta_grid, eps_curve, lw=2, label="MMC4 curve (fit)")
+    ax.plot(eta_grid, eps_curve, lw=2.5, color=curve_color,
+            label=f"MMC4 curve (fit) — {steel_class}")
 
     for name, x, y in pts:
         ax.scatter([x], [y], s=60, edgecolor="k", zorder=5, label=name)
@@ -537,12 +581,17 @@ if st.session_state.get("mmc4_ready", False):
 
     ax.set_xlabel("Triaxiality (η)")
     ax.set_ylabel("Fracture strain (εf)")
-    ax.set_title("MMC4 Curve")
+    ax.set_title(f"MMC4 Curve  |  Steel class: {steel_class}")
     ax.set_xlim(ETA_LO, ETA_HI)
     ax.set_ylim(0.0, float(ef_bulge) + 0.3)
     ax.grid(True, alpha=0.3)
     ax.legend()
     st.pyplot(fig)
+
+    # 강종 판정 요약
+    st.markdown("**강종 판정 (YS/UTS 기준)**")
+    st.write(f"- 입력 YS = {float(ys):.1f} MPa, UTS = {float(uts):.1f} MPa")
+    st.write(f"- 판정 결과: **{steel_class}**")
 
     # 4점/파라미터 출력
     st.markdown("**4점 요약**")
@@ -552,7 +601,7 @@ if st.session_state.get("mmc4_ready", False):
     st.markdown("**적합 파라미터 C1~C6**")
     st.text("C = [" + ", ".join(f"{v:.6f}" for v in C_hat) + "]")
 
-    # 특정 η 입력 → εf 출력 (여기서 값 바꿔도 초기화되지 않음)
+    # 특정 η 입력 → εf 출력
     st.markdown("**특정 η 입력 → εf 출력**")
     eta_query = st.number_input(
         "조회할 Triaxiality (η_query)",
